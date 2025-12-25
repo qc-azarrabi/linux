@@ -6,7 +6,6 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include <linux/arm-smccc.h>
 #include <linux/cpuhotplug.h>
 #include <linux/errno.h>
 #include <linux/firmware.h>
@@ -27,6 +26,7 @@
 #include <linux/tee_core.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
+#include "optee_conduit.h"
 #include "optee_private.h"
 #include "optee_smc.h"
 #include "optee_rpc_cmd.h"
@@ -286,7 +286,7 @@ static void optee_enable_shm_cache(struct optee *optee)
 	/* We need to retry until secure world isn't busy. */
 	optee_cq_wait_init(&optee->call_queue, &w, false);
 	while (true) {
-		struct arm_smccc_res res;
+		struct optee_conduit_res res;
 
 		optee->smc.invoke_fn(OPTEE_SMC_ENABLE_SHM_CACHE,
 				     0, 0, 0, 0, 0, 0, 0, &res);
@@ -312,7 +312,7 @@ static void __optee_disable_shm_cache(struct optee *optee, bool is_mapped)
 	optee_cq_wait_init(&optee->call_queue, &w, false);
 	while (true) {
 		union {
-			struct arm_smccc_res smccc;
+			struct optee_conduit_res smccc;
 			struct optee_smc_disable_shm_cache_result result;
 		} res;
 
@@ -928,7 +928,7 @@ static int optee_smc_do_call_with_arg(struct tee_context *ctx,
 	/* Initialize waiter */
 	optee_cq_wait_init(&optee->call_queue, &w, system_thread);
 	while (true) {
-		struct arm_smccc_res res;
+		struct optee_conduit_res res;
 
 		trace_optee_invoke_fn_begin(&param);
 		optee->smc.invoke_fn(param.a0, param.a1, param.a2, param.a3,
@@ -1036,7 +1036,7 @@ out:
 static u32 get_async_notif_value(optee_invoke_fn *invoke_fn, bool *value_valid,
 				 bool *value_pending)
 {
-	struct arm_smccc_res res;
+	struct optee_conduit_res res;
 
 	invoke_fn(OPTEE_SMC_GET_ASYNC_NOTIF_VALUE, 0, 0, 0, 0, 0, 0, 0, &res);
 
@@ -1286,7 +1286,7 @@ static const struct optee_ops optee_ops = {
 
 static int enable_async_notif(optee_invoke_fn *invoke_fn)
 {
-	struct arm_smccc_res res;
+	struct optee_conduit_res res;
 
 	invoke_fn(OPTEE_SMC_ENABLE_ASYNC_NOTIF, 0, 0, 0, 0, 0, 0, 0, &res);
 
@@ -1297,7 +1297,7 @@ static int enable_async_notif(optee_invoke_fn *invoke_fn)
 
 static bool optee_msg_api_uid_is_optee_api(optee_invoke_fn *invoke_fn)
 {
-	struct arm_smccc_res res;
+	struct optee_conduit_res res;
 
 	invoke_fn(OPTEE_SMC_CALLS_UID, 0, 0, 0, 0, 0, 0, 0, &res);
 
@@ -1310,7 +1310,7 @@ static bool optee_msg_api_uid_is_optee_api(optee_invoke_fn *invoke_fn)
 #ifdef CONFIG_OPTEE_INSECURE_LOAD_IMAGE
 static bool optee_msg_api_uid_is_optee_image_load(optee_invoke_fn *invoke_fn)
 {
-	struct arm_smccc_res res;
+	struct optee_conduit_res res;
 
 	invoke_fn(OPTEE_SMC_CALLS_UID, 0, 0, 0, 0, 0, 0, 0, &res);
 
@@ -1326,7 +1326,7 @@ static bool optee_msg_api_uid_is_optee_image_load(optee_invoke_fn *invoke_fn)
 static void optee_msg_get_os_revision(optee_invoke_fn *invoke_fn)
 {
 	union {
-		struct arm_smccc_res smccc;
+		struct optee_conduit_res smccc;
 		struct optee_smc_call_get_os_revision_result result;
 	} res = {
 		.result = {
@@ -1348,7 +1348,7 @@ static void optee_msg_get_os_revision(optee_invoke_fn *invoke_fn)
 static bool optee_msg_api_revision_is_compatible(optee_invoke_fn *invoke_fn)
 {
 	union {
-		struct arm_smccc_res smccc;
+		struct optee_conduit_res smccc;
 		struct optee_smc_calls_revision_result result;
 	} res;
 
@@ -1365,7 +1365,7 @@ static bool optee_msg_exchange_capabilities(optee_invoke_fn *invoke_fn,
 					    unsigned int *rpc_param_count)
 {
 	union {
-		struct arm_smccc_res smccc;
+		struct optee_conduit_res smccc;
 		struct optee_smc_exchange_capabilities_result result;
 	} res;
 	u32 a1 = 0;
@@ -1399,7 +1399,7 @@ static bool optee_msg_exchange_capabilities(optee_invoke_fn *invoke_fn,
 
 static unsigned int optee_msg_get_thread_count(optee_invoke_fn *invoke_fn)
 {
-	struct arm_smccc_res res;
+	struct optee_conduit_res res;
 
 	invoke_fn(OPTEE_SMC_GET_THREAD_COUNT, 0, 0, 0, 0, 0, 0, 0, &res);
 	if (res.a0)
@@ -1411,7 +1411,7 @@ static struct tee_shm_pool *
 optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm)
 {
 	union {
-		struct arm_smccc_res smccc;
+		struct optee_conduit_res smccc;
 		struct optee_smc_get_shm_config_result result;
 	} res;
 	unsigned long vaddr;
@@ -1453,45 +1453,6 @@ optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm)
 		*memremaped_shm = va;
 
 	return rc;
-}
-
-/* Simple wrapper functions to be able to use a function pointer */
-static void optee_smccc_smc(unsigned long a0, unsigned long a1,
-			    unsigned long a2, unsigned long a3,
-			    unsigned long a4, unsigned long a5,
-			    unsigned long a6, unsigned long a7,
-			    struct arm_smccc_res *res)
-{
-	arm_smccc_smc(a0, a1, a2, a3, a4, a5, a6, a7, res);
-}
-
-static void optee_smccc_hvc(unsigned long a0, unsigned long a1,
-			    unsigned long a2, unsigned long a3,
-			    unsigned long a4, unsigned long a5,
-			    unsigned long a6, unsigned long a7,
-			    struct arm_smccc_res *res)
-{
-	arm_smccc_hvc(a0, a1, a2, a3, a4, a5, a6, a7, res);
-}
-
-static optee_invoke_fn *get_invoke_func(struct device *dev)
-{
-	const char *method;
-
-	pr_info("probing for conduit method.\n");
-
-	if (device_property_read_string(dev, "method", &method)) {
-		pr_warn("missing \"method\" property\n");
-		return ERR_PTR(-ENXIO);
-	}
-
-	if (!strcmp("hvc", method))
-		return optee_smccc_hvc;
-	else if (!strcmp("smc", method))
-		return optee_smccc_smc;
-
-	pr_warn("invalid \"method\" property: %s\n", method);
-	return ERR_PTR(-EINVAL);
 }
 
 /* optee_remove - Device Removal Routine
@@ -1560,7 +1521,7 @@ static int optee_load_fw(struct platform_device *pdev,
 			 optee_invoke_fn *invoke_fn)
 {
 	const struct firmware *fw = NULL;
-	struct arm_smccc_res res;
+	struct optee_conduit_res res;
 	phys_addr_t data_pa;
 	u8 *data_buf = NULL;
 	u64 data_size;
@@ -1653,7 +1614,7 @@ static struct tee_protmem_pool *static_protmem_pool_init(struct optee *optee)
 {
 #if IS_ENABLED(CONFIG_OPTEE_STATIC_PROTMEM_POOL)
 	union {
-		struct arm_smccc_res smccc;
+		struct optee_conduit_res smccc;
 		struct optee_smc_get_protmem_config_result result;
 	} res;
 	struct tee_protmem_pool *pool;
@@ -1732,7 +1693,7 @@ static int optee_probe(struct platform_device *pdev)
 	u32 sec_caps;
 	int rc;
 
-	invoke_fn = get_invoke_func(&pdev->dev);
+	invoke_fn = arch_get_invoke_func(&pdev->dev);
 	if (IS_ERR(invoke_fn))
 		return PTR_ERR(invoke_fn);
 

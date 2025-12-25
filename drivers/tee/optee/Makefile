@@ -7,6 +7,7 @@ optee-objs += rpc.o
 optee-objs += protmem.o
 optee-objs += supp.o
 optee-objs += device.o
+optee-$(CONFIG_HAVE_ARM_SMCCC) += conduit_arm.o
 optee-objs += smc_abi.o
 optee-objs += ffa_abi.o
 

@@ -13,6 +13,7 @@
 #include <linux/semaphore.h>
 #include <linux/tee_core.h>
 #include <linux/types.h>
+#include "optee_conduit.h"
 #include "optee_msg.h"
 
 #define DRIVER_NAME "optee"
@@ -41,11 +42,6 @@
  * are usually not even close to 255 so we should be safe for now.
  */
 #define OPTEE_DEFAULT_MAX_NOTIF_VALUE	255
-
-typedef void (optee_invoke_fn)(unsigned long, unsigned long, unsigned long,
-				unsigned long, unsigned long, unsigned long,
-				unsigned long, unsigned long,
-				struct arm_smccc_res *);
 
 /*
  * struct optee_call_waiter - TEE entry may need to wait for a free TEE thread

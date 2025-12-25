@@ -38,7 +38,7 @@ TRACE_EVENT(optee_invoke_fn_begin,
 );
 
 TRACE_EVENT(optee_invoke_fn_end,
-	TP_PROTO(struct optee_rpc_param *param, struct arm_smccc_res *res),
+	TP_PROTO(struct optee_rpc_param *param, struct optee_conduit_res *res),
 	TP_ARGS(param, res),
 
 	TP_STRUCT__entry(
