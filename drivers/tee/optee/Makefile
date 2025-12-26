@@ -8,6 +8,7 @@ optee-objs += protmem.o
 optee-objs += supp.o
 optee-objs += device.o
 optee-$(CONFIG_HAVE_ARM_SMCCC) += conduit_arm.o
+optee-$(CONFIG_RISCV_SBI_MPXY_MBOX) += conduit_riscv.o
 optee-objs += optee_abi.o
 optee-$(CONFIG_ARM_FFA_TRANSPORT) += ffa_abi.o
 

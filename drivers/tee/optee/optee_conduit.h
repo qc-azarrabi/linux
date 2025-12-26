@@ -35,7 +35,7 @@ typedef void (optee_invoke_fn)(unsigned long, unsigned long, unsigned long,
 			       unsigned long, unsigned long,
 			       struct optee_conduit_res *);
 
-#if defined(CONFIG_HAVE_ARM_SMCCC)
+#if defined(CONFIG_HAVE_ARM_SMCCC) || defined(CONFIG_RISCV_SBI_MPXY_MBOX)
 
 optee_invoke_fn *arch_get_invoke_func(struct device *dev);
 
@@ -46,6 +46,6 @@ static inline optee_invoke_fn *arch_get_invoke_func(struct device *dev)
 	return NULL;
 }
 
-#endif /* CONFIG_HAVE_ARM_SMCCC */
+#endif /* CONFIG_HAVE_ARM_SMCCC || CONFIG_RISCV_SBI_MPXY_MBOX */
 
 #endif /* OPTEE_CONDUIT_H */
