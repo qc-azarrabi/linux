@@ -393,7 +393,15 @@ static inline void reg_pair_from_64(u32 *reg0, u32 *reg1, u64 val)
 /* Registration of the ABIs */
 int optee_smc_abi_register(void);
 void optee_smc_abi_unregister(void);
+#ifdef CONFIG_ARM_FFA_TRANSPORT
 int optee_ffa_abi_register(void);
 void optee_ffa_abi_unregister(void);
+#else
+static inline int optee_ffa_abi_register(void)
+{
+    return -EOPNOTSUPP;
+}
+static inline void optee_ffa_abi_unregister(void) {}
+#endif
 
 #endif /*OPTEE_PRIVATE_H*/
