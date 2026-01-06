@@ -8,8 +8,8 @@ optee-objs += protmem.o
 optee-objs += supp.o
 optee-objs += device.o
 optee-$(CONFIG_HAVE_ARM_SMCCC) += conduit_arm.o
-optee-objs += smc_abi.o
+optee-objs += optee_abi.o
 optee-objs += ffa_abi.o
 
 # for tracing framework to find optee_trace.h
-CFLAGS_smc_abi.o := -I$(src)
+CFLAGS_optee_abi.o := -I$(src)
