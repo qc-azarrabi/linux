@@ -10,6 +10,8 @@
 #include <linux/mailbox_client.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
+#include <linux/gfp.h>
+#include <linux/mm.h>
 #include <asm/sbi.h>
 #include <asm/smp.h>
 #include "optee_conduit.h"
@@ -379,7 +381,7 @@ static void riscv_mpxy_tee_probe_features(void)
 	}
 }
 
-/* Send MEM_PARCEL_CREATE for a single 4kB-page block; return status + id. */
+/* Send MEM_PARCEL_CREATE for a single block; return status, set *out_id. */
 static int parcel_do_create(u32 nonce, u32 creator_access, u32 recv_access,
 			    u32 flags, u64 page, u32 npages, u32 *out_id)
 {
@@ -495,6 +497,106 @@ static int parcel_do_reclaim(u32 id)
 	return le32_to_cpu(rx.status);
 }
 
+/*
+ * Exercise the framework-answered memory parcel lifecycle at probe time. A
+ * single two-page block is described from REE-owned memory and driven through
+ * the positive path (CREATE -> ACCEPT -> RELEASE -> RECLAIM) plus the negative
+ * cases the firmware state machine must reject. Results are logged with a
+ * "PARCEL" prefix; no OP-TEE domain switch is involved.
+ */
+static void riscv_mpxy_tee_parcel_selftest(void)
+{
+	const u32 rw = RPMI_TEE_PARCEL_ACCESS_R | RPMI_TEE_PARCEL_ACCESS_W;
+	const u32 npages = 2;
+	unsigned long va;
+	u64 page, exp_high, exp_low;
+	u32 id, bc, pc;
+	__le32 bh, bl;
+	int st;
+
+	va = __get_free_pages(GFP_KERNEL, 1); /* 2 contiguous pages */
+	if (!va) {
+		pr_info("PARCEL selftest: page allocation failed\n");
+		return;
+	}
+	page = (u64)virt_to_phys((void *)va) >> 12;
+	exp_high = page >> 20;
+	exp_low = ((page & 0xFFFFF) << 12) | (npages - 1);
+
+	/* Positive: share R|W through the full lifecycle. */
+	st = parcel_do_create(0x1234, rw, rw, 0, page, npages, &id);
+	pr_info("PARCEL create status=%d id=0x%x (expect 0)\n", st, id);
+	if (st == 0) {
+		bc = pc = 0;
+		bh = bl = 0;
+		st = parcel_do_accept(id, 0x1234, rw, rw, 0, npages,
+				      &bc, &pc, &bh, &bl);
+		pr_info("PARCEL accept status=%d block_cnt=%u page_cnt=%u match=%d (expect 0)\n",
+			st, bc, pc,
+			(bc == 1 && pc == npages &&
+			 le32_to_cpu(bh) == (u32)exp_high &&
+			 le32_to_cpu(bl) == (u32)exp_low));
+		st = parcel_do_release(id, RPMI_TEE_ENDPOINT_OPTEE);
+		pr_info("PARCEL release status=%d (expect 0)\n", st);
+		st = parcel_do_reclaim(id);
+		pr_info("PARCEL reclaim status=%d (expect 0)\n", st);
+	}
+
+	/* Negative: ACCEPT with a mismatched nonce -> INVALID_PARAM. */
+	st = parcel_do_create(0x2000, rw, rw, 0, page, npages, &id);
+	if (st == 0) {
+		st = parcel_do_accept(id, 0x2001, rw, rw, 0, npages,
+				      NULL, NULL, NULL, NULL);
+		pr_info("PARCEL neg bad-nonce accept status=%d (expect -3)\n", st);
+		parcel_do_reclaim(id);
+	}
+
+	/* Negative: acceptor capacity below parcel size -> INVALID_PARAM. */
+	st = parcel_do_create(0x3000, rw, rw, 0, page, npages, &id);
+	if (st == 0) {
+		st = parcel_do_accept(id, 0x3000, rw, rw, 0, npages - 1,
+				      NULL, NULL, NULL, NULL);
+		pr_info("PARCEL neg small-maxpages accept status=%d (expect -3)\n",
+			st);
+		parcel_do_reclaim(id);
+	}
+
+	/* Negative: RECLAIM while a receiver still holds the parcel -> DENIED. */
+	st = parcel_do_create(0x4000, rw, rw, 0, page, npages, &id);
+	if (st == 0) {
+		parcel_do_accept(id, 0x4000, rw, rw, 0, npages,
+				 NULL, NULL, NULL, NULL);
+		st = parcel_do_reclaim(id);
+		pr_info("PARCEL neg reclaim-before-release status=%d (expect -4)\n",
+			st);
+		parcel_do_release(id, RPMI_TEE_ENDPOINT_OPTEE);
+		parcel_do_reclaim(id);
+	}
+
+	/*
+	 * Owner-transfer (donate). The creator keeps no access but the
+	 * receiver still gets R|W (creator_access == 0 no longer caps the
+	 * receiver's grant on a donate), so ACCEPT succeeds and destroys the
+	 * handle; a later RECLAIM of the same id then fails lookup with
+	 * INVALID_PARAM.
+	 */
+	st = parcel_do_create(0x5000, 0, rw,
+			      RPMI_TEE_PARCEL_CREATE_FLAG_OWNER_XFER,
+			      page, npages, &id);
+	pr_info("PARCEL donate create status=%d id=0x%x (expect 0)\n", st, id);
+	if (st == 0) {
+		st = parcel_do_accept(id, 0x5000, 0, rw, 0, npages,
+				      NULL, NULL, NULL, NULL);
+		pr_info("PARCEL donate accept status=%d (expect 0)\n", st);
+		st = parcel_do_reclaim(id);
+		pr_info("PARCEL donate reclaim status=%d (expect -3, destroyed)\n",
+			st);
+	}
+
+	free_pages(va, 1);
+	pr_info("PARCEL selftest done\n");
+}
+
 static int riscv_mpxy_mbox_probe(struct device *dev)
 {
         struct rpmi_mbox_message msg;
@@ -590,6 +692,9 @@ static int riscv_mpxy_mbox_probe(struct device *dev)
 
         /* Log framework-answered TEE services (PROBE_FEATURES / notify) */
         riscv_mpxy_tee_probe_features();
+
+        /* Exercise the framework-answered memory parcel lifecycle. */
+        riscv_mpxy_tee_parcel_selftest();
 
         return 0;
 
