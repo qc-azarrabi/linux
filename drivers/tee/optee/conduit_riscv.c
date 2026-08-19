@@ -39,6 +39,8 @@ enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_MEM_PARCEL_ACCEPT = 0x0A,
 	RPMI_TEE_SRV_MEM_PARCEL_RELEASE = 0x0B,
 	RPMI_TEE_SRV_MEM_PARCEL_RECLAIM = 0x0C,
+	RPMI_TEE_SRV_MEM_PARCEL_SEGMENT_SEND = 0x0D,
+	RPMI_TEE_SRV_MEM_PARCEL_SEGMENT_RECEIVE = 0x0E,
 	RPMI_TEE_SRV_TEE_CALL = 0x13,
 	RPMI_TEE_SRV_MAX_COUNT,
 };
@@ -144,6 +146,39 @@ struct rpmi_tee_mem_parcel_reclaim_req {
 struct rpmi_tee_mem_parcel_reclaim_resp {
 	__le32 status;
 	__le32 flags;
+};
+
+/* ACCEPT response FLAGS: block list did not fit, pull remainder via RECEIVE */
+#define RPMI_TEE_PARCEL_ACCEPT_RESP_FLAG_MULTI_SEGMENT	(1U << 31)
+
+/* SEGMENT_SEND/RECEIVE (0x0D/0x0E): stream a block list too large for one msg */
+#define RPMI_TEE_PARCEL_SEGMENT_FLAG_LAST	(1U << 31)
+#define RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS	4
+
+/* SEGMENT_SEND request: header + block_high[block_cnt] block_low[block_cnt] */
+struct rpmi_tee_mem_parcel_segment_send_req {
+	__le32 mem_parcel_id;
+	__le32 flags;
+	__le32 block_cnt;
+	__le32 data[];
+};
+
+struct rpmi_tee_mem_parcel_segment_send_resp {
+	__le32 status;
+};
+
+/* SEGMENT_RECEIVE request: pull the next segment for an in-progress accept */
+struct rpmi_tee_mem_parcel_segment_receive_req {
+	__le32 acceptor_id;
+	__le32 mem_parcel_id;
+};
+
+/* SEGMENT_RECEIVE response: header + block_high[block_cnt] block_low[block_cnt] */
+struct rpmi_tee_mem_parcel_segment_receive_resp {
+	__le32 status;
+	__le32 flags;
+	__le32 block_cnt;
+	__le32 data[];
 };
 
 /** TEE Implementation IDs */
@@ -498,6 +533,268 @@ static int parcel_do_reclaim(u32 id)
 }
 
 /*
+ * MEM_PARCEL_CREATE with the MULTI_SEGMENT flag and no initial block batch:
+ * carries only the receiver metadata and leaves the parcel constructing. The
+ * block list is streamed afterward via SEGMENT_SEND.
+ */
+static int parcel_do_create_multiseg(u32 nonce, u32 creator_access,
+				     u32 recv_access, u32 *out_id)
+{
+	u8 buf[sizeof(struct rpmi_tee_mem_parcel_create_req) + 2 * sizeof(__le32)];
+	struct rpmi_tee_mem_parcel_create_req *req = (void *)buf;
+	struct rpmi_tee_mem_parcel_create_resp rx = {0};
+	struct rpmi_mbox_message msg;
+	int ret;
+
+	memset(buf, 0, sizeof(buf));
+	req->creator_id = cpu_to_le32(RPMI_TEE_ENDPOINT_REE);
+	req->creator_access = cpu_to_le32(creator_access);
+	req->receiver_cnt = cpu_to_le32(1);
+	req->flags = cpu_to_le32(RPMI_TEE_PARCEL_CREATE_FLAG_MULTI_SEGMENT);
+	req->nonce = cpu_to_le32(nonce);
+	req->block_cnt = cpu_to_le32(0);
+	/* data[]: receiver_id[1], access[1] (no blocks yet) */
+	req->data[0] = cpu_to_le32(RPMI_TEE_ENDPOINT_OPTEE);
+	req->data[1] = cpu_to_le32(recv_access);
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_MEM_PARCEL_CREATE,
+					  req, sizeof(buf), &rx, sizeof(rx));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret)
+		return ret;
+	if (out_id)
+		*out_id = le32_to_cpu(rx.mem_parcel_id);
+	return le32_to_cpu(rx.status);
+}
+
+/*
+ * SEGMENT_SEND: append a batch of one-page blocks (base_page .. base_page+n-1)
+ * to the parcel under construction; set last on the final segment. The
+ * server tracks segment ordering itself, so no client-supplied index is
+ * sent. Returns status.
+ */
+static int parcel_do_segment_send(u32 id, bool last, u64 base_page, u32 n)
+{
+	u8 buf[sizeof(struct rpmi_tee_mem_parcel_segment_send_req) +
+	       2 * RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS * sizeof(__le32)];
+	struct rpmi_tee_mem_parcel_segment_send_req *req = (void *)buf;
+	struct rpmi_tee_mem_parcel_segment_send_resp rx = {0};
+	struct rpmi_mbox_message msg;
+	u32 i;
+	int ret;
+
+	memset(buf, 0, sizeof(buf));
+	req->mem_parcel_id = cpu_to_le32(id);
+	req->flags = cpu_to_le32(last ? RPMI_TEE_PARCEL_SEGMENT_FLAG_LAST : 0);
+	req->block_cnt = cpu_to_le32(n);
+	/* data[]: block_high[n] then block_low[n] */
+	for (i = 0; i < n; i++) {
+		u64 page = base_page + i;
+
+		req->data[i] = cpu_to_le32((u32)(page >> 20));
+		req->data[n + i] =
+			cpu_to_le32((u32)(((page & 0xFFFFF) << 12) | 0));
+	}
+
+	rpmi_mbox_init_send_with_response(&msg,
+					  RPMI_TEE_SRV_MEM_PARCEL_SEGMENT_SEND,
+					  req,
+					  sizeof(*req) + 2 * n * sizeof(__le32),
+					  &rx, sizeof(rx));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret)
+		return ret;
+	return le32_to_cpu(rx.status);
+}
+
+/*
+ * SEGMENT_RECEIVE: pull up to RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS blocks of the
+ * next unreceived segment into out_high[]/out_low[]. The server tracks the
+ * receive cursor itself; acceptor_id identifies the caller as the registered
+ * receiver. Returns status; reports the count returned and whether this was
+ * the final segment.
+ */
+static int parcel_do_segment_receive(u32 id, u32 acceptor_id, u32 *out_bc,
+				     bool *out_last, __le32 *out_high,
+				     __le32 *out_low)
+{
+	u8 rbuf[sizeof(struct rpmi_tee_mem_parcel_segment_receive_resp) +
+		2 * RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS * sizeof(__le32)];
+	struct rpmi_tee_mem_parcel_segment_receive_resp *rx = (void *)rbuf;
+	struct rpmi_tee_mem_parcel_segment_receive_req tx = {0};
+	struct rpmi_mbox_message msg;
+	u32 bc, i;
+	int ret;
+
+	memset(rbuf, 0, sizeof(rbuf));
+	tx.acceptor_id = cpu_to_le32(acceptor_id);
+	tx.mem_parcel_id = cpu_to_le32(id);
+
+	rpmi_mbox_init_send_with_response(&msg,
+					  RPMI_TEE_SRV_MEM_PARCEL_SEGMENT_RECEIVE,
+					  &tx, sizeof(tx), rx, sizeof(rbuf));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret)
+		return ret;
+
+	bc = le32_to_cpu(rx->block_cnt);
+	if (out_bc)
+		*out_bc = bc;
+	if (out_last)
+		*out_last = !!(le32_to_cpu(rx->flags) &
+			       RPMI_TEE_PARCEL_SEGMENT_FLAG_LAST);
+	/* data[]: block_high[bc] then block_low[bc] */
+	for (i = 0; i < bc && i < RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS; i++) {
+		if (out_high)
+			out_high[i] = rx->data[i];
+		if (out_low)
+			out_low[i] = rx->data[bc + i];
+	}
+	return le32_to_cpu(rx->status);
+}
+
+/*
+ * Exercise the multi-segment block-list path. A block list larger than one
+ * SEGMENT batch describes eight one-page blocks over a contiguous REE
+ * allocation. The list is CREATED as multi-segment (metadata only), streamed in
+ * with two SEGMENT_SEND batches, ACCEPTED (returning the full list), and then
+ * pulled back one bounded segment at a time with SEGMENT_RECEIVE - which caps
+ * each response at RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS, so eight blocks require
+ * multiple receives and the final segment carries the LAST flag. Every block is
+ * verified against the known physical pages. Logged with a "PARCEL" prefix.
+ */
+static void riscv_mpxy_tee_parcel_multiseg_selftest(void)
+{
+	const u32 rw = RPMI_TEE_PARCEL_ACCESS_R | RPMI_TEE_PARCEL_ACCESS_W;
+	const u32 nblocks = 8;		/* > SEGMENT_MAX_BLOCKS (=4) */
+	const u32 nonce = 0x7000;
+	/* ACCEPT response buffer large enough for the whole block list. */
+	u8 rbuf[sizeof(struct rpmi_tee_mem_parcel_accept_resp) +
+		2 * 8 * sizeof(__le32)];
+	struct rpmi_tee_mem_parcel_accept_resp *arx = (void *)rbuf;
+	struct rpmi_tee_mem_parcel_accept_req atx = {0};
+	struct rpmi_mbox_message msg;
+	__le32 rhigh[RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS];
+	__le32 rlow[RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS];
+	unsigned long va;
+	u64 base_page;
+	u32 id = 0, acc_bc, acc_flags, i, ok;
+	u32 start, seg_count, recv_total;
+	bool last = false;
+	int st;
+
+	va = __get_free_pages(GFP_KERNEL, 3);	/* 8 contiguous pages */
+	if (!va) {
+		pr_info("PARCEL multiseg: page allocation failed\n");
+		return;
+	}
+	base_page = (u64)virt_to_phys((void *)va) >> 12;
+
+	/* CREATE multi-segment (metadata only, no initial blocks). */
+	st = parcel_do_create_multiseg(nonce, rw, rw, &id);
+	pr_info("PARCEL multiseg create status=%d id=0x%x (expect 0)\n", st, id);
+	if (st != 0)
+		goto out;
+
+	/* Stream the 8 blocks in two 4-block segments; LAST finalizes. */
+	st = parcel_do_segment_send(id, false, base_page, 4);
+	pr_info("PARCEL multiseg send seg0 status=%d (expect 0)\n", st);
+	if (st != 0)
+		goto out_reclaim;
+	st = parcel_do_segment_send(id, true, base_page + 4, 4);
+	pr_info("PARCEL multiseg send seg1(LAST) status=%d (expect 0)\n", st);
+	if (st != 0)
+		goto out_reclaim;
+
+	/* ACCEPT: the whole list fits, so it returns all blocks in one response. */
+	memset(rbuf, 0, sizeof(rbuf));
+	atx.acceptor_id = cpu_to_le32(RPMI_TEE_ENDPOINT_OPTEE);
+	atx.access = cpu_to_le32(rw);
+	atx.mem_parcel_id = cpu_to_le32(id);
+	atx.nonce = cpu_to_le32(nonce);
+	atx.creator_id = cpu_to_le32(RPMI_TEE_ENDPOINT_REE);
+	atx.creator_access = cpu_to_le32(rw);
+	atx.max_pages = cpu_to_le32(nblocks);
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_MEM_PARCEL_ACCEPT,
+					  &atx, sizeof(atx), arx, sizeof(rbuf));
+	st = __mpxy_mbox_send_message(&msg);
+	if (st) {
+		pr_info("PARCEL multiseg accept send failed: %d\n", st);
+		goto out_reclaim;
+	}
+	st = le32_to_cpu(arx->status);
+	acc_bc = le32_to_cpu(arx->block_cnt);
+	acc_flags = le32_to_cpu(arx->flags);
+	pr_info("PARCEL multiseg accept status=%d block_cnt=%u multiseg=%d (expect 0/8/0)\n",
+		st, acc_bc,
+		!!(acc_flags & RPMI_TEE_PARCEL_ACCEPT_RESP_FLAG_MULTI_SEGMENT));
+	if (st != 0)
+		goto out_release;
+
+	/* Verify all blocks carried in the ACCEPT response. */
+	ok = (acc_bc == nblocks) ? 1 : 0;
+	for (i = 0; i < acc_bc && i < nblocks; i++) {
+		u64 page = base_page + i;
+
+		if (le32_to_cpu(arx->data[i]) != (u32)(page >> 20) ||
+		    le32_to_cpu(arx->data[acc_bc + i]) !=
+			    (u32)(((page & 0xFFFFF) << 12) | 0))
+			ok = 0;
+	}
+	pr_info("PARCEL multiseg accept blocklist match=%d (expect 1)\n", ok);
+
+	/*
+	 * Receive-side segmentation: SEGMENT_RECEIVE caps each response at
+	 * RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS blocks, so pull the full list back
+	 * one bounded segment at a time until the LAST flag is set, verifying
+	 * every block. Eight blocks / four-per-segment => at least two segments.
+	 */
+	ok = 1;
+	start = 0;
+	seg_count = 0;
+	recv_total = 0;
+	do {
+		u32 rbc = 0;
+
+		st = parcel_do_segment_receive(id, RPMI_TEE_ENDPOINT_OPTEE,
+					       &rbc, &last, rhigh, rlow);
+		if (st != 0) {
+			pr_info("PARCEL multiseg receive seg%u status=%d (expect 0)\n",
+				seg_count, st);
+			ok = 0;
+			break;
+		}
+		if (rbc == 0 || rbc > RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS)
+			ok = 0;
+		for (i = 0; i < rbc && i < RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS; i++) {
+			u64 page = base_page + start + i;
+
+			if (le32_to_cpu(rhigh[i]) != (u32)(page >> 20) ||
+			    le32_to_cpu(rlow[i]) !=
+				    (u32)(((page & 0xFFFFF) << 12) | 0))
+				ok = 0;
+		}
+		start += rbc;
+		recv_total += rbc;
+		seg_count++;
+		pr_info("PARCEL multiseg receive seg%u block_cnt=%u last=%d\n",
+			seg_count - 1, rbc, last);
+	} while (!last && seg_count < 16);
+
+	pr_info("PARCEL multiseg receive segments=%u blocks=%u match=%d (expect >=2/8/1)\n",
+		seg_count, recv_total,
+		(ok && recv_total == nblocks && last && seg_count >= 2));
+
+out_release:
+	parcel_do_release(id, RPMI_TEE_ENDPOINT_OPTEE);
+out_reclaim:
+	parcel_do_reclaim(id);
+out:
+	free_pages(va, 3);
+	pr_info("PARCEL multiseg selftest done\n");
+}
+
+/*
  * Exercise the framework-answered memory parcel lifecycle at probe time. A
  * single two-page block is described from REE-owned memory and driven through
  * the positive path (CREATE -> ACCEPT -> RELEASE -> RECLAIM) plus the negative
@@ -760,6 +1057,9 @@ static int riscv_mpxy_mbox_probe(struct device *dev)
 
         /* Exercise end-to-end OP-TEE-side parcel consumption. */
         riscv_mpxy_tee_parcel_consume_selftest();
+
+        /* Exercise the multi-segment block-list transfer path. */
+        riscv_mpxy_tee_parcel_multiseg_selftest();
 
         return 0;
 
