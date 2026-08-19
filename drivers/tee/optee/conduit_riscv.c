@@ -35,6 +35,7 @@ static struct mpxy_tee_context *context;
 enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
 	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
+	RPMI_TEE_SRV_PROBE_SYSTEM = 0x03,
 	RPMI_TEE_SRV_MEM_PARCEL_CREATE = 0x09,
 	RPMI_TEE_SRV_MEM_PARCEL_ACCEPT = 0x0A,
 	RPMI_TEE_SRV_MEM_PARCEL_RELEASE = 0x0B,
@@ -63,6 +64,21 @@ struct rpmi_tee_probe_features_req {
 struct rpmi_tee_probe_features_resp {
 	__le32 status;
 	__le32 value;
+};
+
+/** TEE_PROBE_SYSTEM request / response (must match OpenSBI) */
+#define RPMI_TEE_SYSINFO_FORMAT_NONE	0
+#define RPMI_TEE_SYSINFO_FORMAT_CBOR	1
+
+struct rpmi_tee_probe_system_req {
+	__le32 reserved;
+};
+
+struct rpmi_tee_probe_system_resp {
+	__le32 status;
+	__le32 format;
+	__le32 info_len;
+	u8 data[];
 };
 
 /*
@@ -416,7 +432,102 @@ static void riscv_mpxy_tee_probe_features(void)
 	}
 }
 
-/* Send MEM_PARCEL_CREATE for a single block; return status, set *out_id. */
+/*
+ * Minimal CBOR reader for the fixed PROBE_SYSTEM system-info map. Only the
+ * subset the OpenSBI encoder emits is decoded: a short definite-length map of
+ * short text-string keys to unsigned integers. Advances *off; returns 0 on a
+ * successfully decoded pair, negative on malformed input or overflow.
+ */
+static int cbor_read_uint(const u8 *buf, u32 len, u32 *off, u32 *out)
+{
+	u8 b;
+
+	if (*off >= len)
+		return -1;
+	b = buf[(*off)++];
+	if (b < 24) {
+		*out = b;
+	} else if (b == 0x18) {
+		if (*off + 1 > len)
+			return -1;
+		*out = buf[(*off)++];
+	} else if (b == 0x19) {
+		if (*off + 2 > len)
+			return -1;
+		*out = ((u32)buf[*off] << 8) | buf[*off + 1];
+		*off += 2;
+	} else if (b == 0x1a) {
+		if (*off + 4 > len)
+			return -1;
+		*out = ((u32)buf[*off] << 24) | ((u32)buf[*off + 1] << 16) |
+		       ((u32)buf[*off + 2] << 8) | buf[*off + 3];
+		*off += 4;
+	} else {
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * TEE_PROBE_SYSTEM (0x03): request the CBOR system-info blob and print the
+ * decoded parcel-manager capacities. Framework-answered; QEMU-testable.
+ */
+static void riscv_mpxy_tee_probe_system(void)
+{
+	struct rpmi_tee_probe_system_req tx = { .reserved = 0 };
+	struct {
+		struct rpmi_tee_probe_system_resp resp;
+		u8 data[128];
+	} rx = {0};
+	struct rpmi_mbox_message msg;
+	u32 off = 0, npairs, i, format, info_len;
+	const u8 *blob = rx.resp.data;
+	int ret;
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_PROBE_SYSTEM,
+					  &tx, sizeof(tx), &rx, sizeof(rx));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret) {
+		pr_info("PROBE_SYSTEM send failed: %d\n", ret);
+		return;
+	}
+
+	format = le32_to_cpu(rx.resp.format);
+	info_len = le32_to_cpu(rx.resp.info_len);
+	pr_info("PROBE_SYSTEM status=%d format=%u info_len=%u (expect 0/1 CBOR)\n",
+		le32_to_cpu(rx.resp.status), format, info_len);
+
+	if (format != RPMI_TEE_SYSINFO_FORMAT_CBOR || info_len > sizeof(rx.data))
+		return;
+
+	/* Map header (major type 5). */
+	if (off >= info_len || (blob[off] & 0xe0) != 0xa0) {
+		pr_info("PROBE_SYSTEM CBOR: not a map\n");
+		return;
+	}
+	npairs = blob[off++] & 0x1f;
+
+	for (i = 0; i < npairs; i++) {
+		u32 klen, kstart, val;
+		char key[24];
+
+		if (off >= info_len || (blob[off] & 0xe0) != 0x60)
+			break;
+		klen = blob[off++] & 0x1f;
+		if (off + klen > info_len || klen >= sizeof(key))
+			break;
+		kstart = off;
+		memcpy(key, &blob[kstart], klen);
+		key[klen] = '\0';
+		off += klen;
+		if (cbor_read_uint(blob, info_len, &off, &val))
+			break;
+		pr_info("PROBE_SYSTEM cap %s=%u\n", key, val);
+	}
+	pr_info("PROBE_SYSTEM selftest done\n");
+}
+
+/* Send MEM_PARCEL_CREATE for a single 4kB-page block; return status + id. */
 static int parcel_do_create(u32 nonce, u32 creator_access, u32 recv_access,
 			    u32 flags, u64 page, u32 npages, u32 *out_id)
 {
@@ -795,11 +906,9 @@ out:
 }
 
 /*
- * Exercise the framework-answered memory parcel lifecycle at probe time. A
- * single two-page block is described from REE-owned memory and driven through
- * the positive path (CREATE -> ACCEPT -> RELEASE -> RECLAIM) plus the negative
- * cases the firmware state machine must reject. Results are logged with a
- * "PARCEL" prefix; no OP-TEE domain switch is involved.
+ * Exercise the framework-answered memory parcel lifecycle: the positive share
+ * round trip (create -> accept -> release -> reclaim), three negative cases
+ * the firmware state machine must reject, and the donate/owner-transfer case.
  */
 static void riscv_mpxy_tee_parcel_selftest(void)
 {
@@ -871,18 +980,16 @@ static void riscv_mpxy_tee_parcel_selftest(void)
 	}
 
 	/*
-	 * Owner-transfer (donate). The creator keeps no access but the
-	 * receiver still gets R|W (creator_access == 0 no longer caps the
-	 * receiver's grant on a donate), so ACCEPT succeeds and destroys the
-	 * handle; a later RECLAIM of the same id then fails lookup with
-	 * INVALID_PARAM.
+	 * Negative: owner-transfer (donate). The creator keeps no access, so
+	 * ACCEPT succeeds and destroys the handle; a later RECLAIM of the same
+	 * id then fails lookup with INVALID_PARAM.
 	 */
-	st = parcel_do_create(0x5000, 0, rw,
+	st = parcel_do_create(0x5000, 0, 0,
 			      RPMI_TEE_PARCEL_CREATE_FLAG_OWNER_XFER,
 			      page, npages, &id);
 	pr_info("PARCEL donate create status=%d id=0x%x (expect 0)\n", st, id);
 	if (st == 0) {
-		st = parcel_do_accept(id, 0x5000, 0, rw, 0, npages,
+		st = parcel_do_accept(id, 0x5000, 0, 0, 0, npages,
 				      NULL, NULL, NULL, NULL);
 		pr_info("PARCEL donate accept status=%d (expect 0)\n", st);
 		st = parcel_do_reclaim(id);
@@ -1051,6 +1158,9 @@ static int riscv_mpxy_mbox_probe(struct device *dev)
 
         /* Log framework-answered TEE services (PROBE_FEATURES / notify) */
         riscv_mpxy_tee_probe_features();
+
+        /* Print the CBOR system-info capacities (PROBE_SYSTEM). */
+        riscv_mpxy_tee_probe_system();
 
         /* Exercise the framework-answered memory parcel lifecycle. */
         riscv_mpxy_tee_parcel_selftest();
