@@ -33,6 +33,10 @@ static struct mpxy_tee_context *context;
 enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
 	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
+	RPMI_TEE_SRV_MEM_PARCEL_CREATE = 0x09,
+	RPMI_TEE_SRV_MEM_PARCEL_ACCEPT = 0x0A,
+	RPMI_TEE_SRV_MEM_PARCEL_RELEASE = 0x0B,
+	RPMI_TEE_SRV_MEM_PARCEL_RECLAIM = 0x0C,
 	RPMI_TEE_SRV_TEE_CALL = 0x13,
 	RPMI_TEE_SRV_MAX_COUNT,
 };
@@ -55,6 +59,89 @@ struct rpmi_tee_probe_features_req {
 struct rpmi_tee_probe_features_resp {
 	__le32 status;
 	__le32 value;
+};
+
+/*
+ * Memory parcel wire encodings (RPMI spec section 4.16, Tables 198-207).
+ * These MUST byte-match the OpenSBI definitions in
+ * <sbi_utils/mailbox/rpmi_msgprot.h>. All fields are little-endian uint32
+ * words; block-list addresses are expressed in units of 4kB pages.
+ */
+
+/* Memory access encoding (Table 199) */
+#define RPMI_TEE_PARCEL_ACCESS_R	(1U << 29)
+#define RPMI_TEE_PARCEL_ACCESS_W	(1U << 30)
+#define RPMI_TEE_PARCEL_ACCESS_X	(1U << 31)
+
+/* MEM_PARCEL_CREATE FLAGS (Table 200) */
+#define RPMI_TEE_PARCEL_CREATE_FLAG_MULTI_SEGMENT	(1U << 31)
+#define RPMI_TEE_PARCEL_CREATE_FLAG_OWNER_XFER		(1U << 30)
+
+/* Block list encoding (Table 198): addresses in 4kB page units */
+#define RPMI_TEE_PARCEL_LABEL_LEN	16
+
+/* MEM_PARCEL_CREATE request (Table 200): header + receiver/access/block arrays */
+struct rpmi_tee_mem_parcel_create_req {
+	__le32 creator_id;
+	__le32 creator_access;
+	__le32 receiver_cnt;
+	__le32 flags;
+	__le32 nonce;
+	__le32 block_cnt;
+	u8 label[RPMI_TEE_PARCEL_LABEL_LEN];
+	__le32 data[];
+};
+
+struct rpmi_tee_mem_parcel_create_resp {
+	__le32 status;
+	__le32 mem_parcel_id;
+};
+
+/* MEM_PARCEL_ACCEPT request (Table 202): header + other_id/other_access arrays */
+struct rpmi_tee_mem_parcel_accept_req {
+	__le32 acceptor_id;
+	__le32 access;
+	__le32 mem_parcel_id;
+	__le32 nonce;
+	__le32 creator_id;
+	__le32 creator_access;
+	__le32 flags;
+	__le32 address_high;
+	__le32 address_low;
+	__le32 max_pages;
+	__le32 other_cnt;
+	__le32 data[];
+};
+
+/* MEM_PARCEL_ACCEPT response (Table 203): header + block_high/block_low arrays */
+struct rpmi_tee_mem_parcel_accept_resp {
+	__le32 status;
+	__le32 flags;
+	__le32 page_cnt;
+	__le32 block_cnt;
+	__le32 data[];
+};
+
+/* MEM_PARCEL_RELEASE request (Table 204) */
+struct rpmi_tee_mem_parcel_release_req {
+	__le32 mem_parcel_id;
+	__le32 flags;
+	__le32 endpoint_cnt;
+	__le32 endpoint_id[];
+};
+
+struct rpmi_tee_mem_parcel_release_resp {
+	__le32 status;
+};
+
+/* MEM_PARCEL_RECLAIM request (Table 206) */
+struct rpmi_tee_mem_parcel_reclaim_req {
+	__le32 mem_parcel_id;
+};
+
+struct rpmi_tee_mem_parcel_reclaim_resp {
+	__le32 status;
+	__le32 flags;
 };
 
 /** TEE Implementation IDs */
@@ -290,6 +377,122 @@ static void riscv_mpxy_tee_probe_features(void)
 			pr_info("ENABLE_NOTIFICATION status=%d (expect NOTSUPP=-2)\n",
 				le32_to_cpu(rx.status));
 	}
+}
+
+/* Send MEM_PARCEL_CREATE for a single 4kB-page block; return status + id. */
+static int parcel_do_create(u32 nonce, u32 creator_access, u32 recv_access,
+			    u32 flags, u64 page, u32 npages, u32 *out_id)
+{
+	u8 buf[sizeof(struct rpmi_tee_mem_parcel_create_req) + 4 * sizeof(__le32)];
+	struct rpmi_tee_mem_parcel_create_req *req = (void *)buf;
+	struct rpmi_tee_mem_parcel_create_resp rx = {0};
+	struct rpmi_mbox_message msg;
+	int ret;
+
+	memset(buf, 0, sizeof(buf));
+	req->creator_id = cpu_to_le32(RPMI_TEE_ENDPOINT_REE);
+	req->creator_access = cpu_to_le32(creator_access);
+	req->receiver_cnt = cpu_to_le32(1);
+	req->flags = cpu_to_le32(flags);
+	req->nonce = cpu_to_le32(nonce);
+	req->block_cnt = cpu_to_le32(1);
+	/* data[]: receiver_id[1], access[1], block_high[1], block_low[1] */
+	req->data[0] = cpu_to_le32(RPMI_TEE_ENDPOINT_OPTEE);
+	req->data[1] = cpu_to_le32(recv_access);
+	req->data[2] = cpu_to_le32((u32)(page >> 20));
+	req->data[3] = cpu_to_le32((u32)(((page & 0xFFFFF) << 12) | (npages - 1)));
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_MEM_PARCEL_CREATE,
+					  req, sizeof(buf), &rx, sizeof(rx));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret)
+		return ret;
+	if (out_id)
+		*out_id = le32_to_cpu(rx.mem_parcel_id);
+	return le32_to_cpu(rx.status);
+}
+
+/* Send MEM_PARCEL_ACCEPT (single receiver); return status, report block list. */
+static int parcel_do_accept(u32 id, u32 nonce, u32 creator_access, u32 access,
+			    u32 flags, u32 max_pages, u32 *out_bc, u32 *out_pc,
+			    __le32 *out_high, __le32 *out_low)
+{
+	u8 rbuf[sizeof(struct rpmi_tee_mem_parcel_accept_resp) + 2 * sizeof(__le32)];
+	struct rpmi_tee_mem_parcel_accept_resp *rx = (void *)rbuf;
+	struct rpmi_tee_mem_parcel_accept_req tx = {0};
+	struct rpmi_mbox_message msg;
+	int ret;
+	u32 bc;
+
+	memset(rbuf, 0, sizeof(rbuf));
+	tx.acceptor_id = cpu_to_le32(RPMI_TEE_ENDPOINT_OPTEE);
+	tx.access = cpu_to_le32(access);
+	tx.mem_parcel_id = cpu_to_le32(id);
+	tx.nonce = cpu_to_le32(nonce);
+	tx.creator_id = cpu_to_le32(RPMI_TEE_ENDPOINT_REE);
+	tx.creator_access = cpu_to_le32(creator_access);
+	tx.flags = cpu_to_le32(flags);
+	tx.max_pages = cpu_to_le32(max_pages);
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_MEM_PARCEL_ACCEPT,
+					  &tx, sizeof(tx), rx, sizeof(rbuf));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret)
+		return ret;
+
+	bc = le32_to_cpu(rx->block_cnt);
+	if (out_bc)
+		*out_bc = bc;
+	if (out_pc)
+		*out_pc = le32_to_cpu(rx->page_cnt);
+	if (bc >= 1) {
+		/* data[]: block_high[bc] then block_low[bc] */
+		if (out_high)
+			*out_high = rx->data[0];
+		if (out_low)
+			*out_low = rx->data[bc];
+	}
+	return le32_to_cpu(rx->status);
+}
+
+/* Send MEM_PARCEL_RELEASE for a single endpoint; return status. */
+static int parcel_do_release(u32 id, u32 endpoint)
+{
+	u8 buf[sizeof(struct rpmi_tee_mem_parcel_release_req) + sizeof(__le32)];
+	struct rpmi_tee_mem_parcel_release_req *req = (void *)buf;
+	struct rpmi_tee_mem_parcel_release_resp rx = {0};
+	struct rpmi_mbox_message msg;
+	int ret;
+
+	memset(buf, 0, sizeof(buf));
+	req->mem_parcel_id = cpu_to_le32(id);
+	req->endpoint_cnt = cpu_to_le32(1);
+	req->endpoint_id[0] = cpu_to_le32(endpoint);
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_MEM_PARCEL_RELEASE,
+					  req, sizeof(buf), &rx, sizeof(rx));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret)
+		return ret;
+	return le32_to_cpu(rx.status);
+}
+
+/* Send MEM_PARCEL_RECLAIM; return status. */
+static int parcel_do_reclaim(u32 id)
+{
+	struct rpmi_tee_mem_parcel_reclaim_req tx = {
+		.mem_parcel_id = cpu_to_le32(id),
+	};
+	struct rpmi_tee_mem_parcel_reclaim_resp rx = {0};
+	struct rpmi_mbox_message msg;
+	int ret;
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_MEM_PARCEL_RECLAIM,
+					  &tx, sizeof(tx), &rx, sizeof(rx));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret)
+		return ret;
+	return le32_to_cpu(rx.status);
 }
 
 static int riscv_mpxy_mbox_probe(struct device *dev)
