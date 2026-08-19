@@ -33,7 +33,7 @@ static struct mpxy_tee_context *context;
 enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
 	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
-	RPMI_TEE_SRV_COMMUNICATE = 0x03,
+	RPMI_TEE_SRV_TEE_CALL = 0x13,
 	RPMI_TEE_SRV_MAX_COUNT,
 };
 
@@ -69,6 +69,21 @@ enum rpmi_tee_impl_id {
 #define RPMI_TEE_OPTEE_COMM_RESP_REGS	4	/* a0-a3 */
 
 /*
+ * Fixed TEE endpoint identities and the well-known "OP-TEE communicate"
+ * service UUID for TEE_CALL (RPMI spec section 4.16). These MUST byte-match the
+ * OpenSBI definitions in <sbi_utils/mailbox/rpmi_msgprot.h>.
+ *
+ * UUID: 5be1b1a0-7e11-4e7a-9b10-0010c0ffee00
+ */
+#define RPMI_TEE_ENDPOINT_REE		0
+#define RPMI_TEE_ENDPOINT_OPTEE	1
+
+static const u8 rpmi_tee_optee_service_uuid[16] = {
+	0x5b, 0xe1, 0xb1, 0xa0, 0x7e, 0x11, 0x4e, 0x7a,
+	0x9b, 0x10, 0x00, 0x10, 0xc0, 0xff, 0xee, 0x00
+};
+
+/*
  * RPMI XLEN-sized type for TEE Service Group
  *
  * Per RPMI TEE spec, registers are XLEN-sized little-endian values:
@@ -89,13 +104,21 @@ typedef __le32 rpmi_xlen_t;
 #endif
 
 /**
- * TEE_COMMUNICATE request data for OP-TEE
+ * TEE_CALL request for OP-TEE (RPMI spec section 4.16, Table 218)
  *
- * OP-TEE uses SMC-style communication with 8 XLEN-sized registers.
- * For RV64: 8 * 8 = 64 bytes
- * For RV32: 8 * 4 = 32 bytes
+ * Fixed identity (SENDER=REE, TARGET=OP-TEE) + well-known service UUID, then
+ * SERVICE_DATA carrying the SMC-style a0-a7 register block.
+ * For RV64: header 28 + 8 * 8 = 92 bytes
+ * For RV32: header 28 + 8 * 4 = 60 bytes
+ *
+ * __packed so the u8[16] UUID does not force padding before service_data_len.
  */
 struct rpmi_tee_optee_req {
+	__le32 sender_id;
+	__le32 target_id;
+	u8 service[16];
+	__le32 service_data_len;
+	/* SERVICE_DATA: register block a0-a7 */
 	rpmi_xlen_t a0;
 	rpmi_xlen_t a1;
 	rpmi_xlen_t a2;
@@ -104,22 +127,27 @@ struct rpmi_tee_optee_req {
 	rpmi_xlen_t a5;
 	rpmi_xlen_t a6;
 	rpmi_xlen_t a7;
-};
+} __packed;
 
 /**
- * TEE_COMMUNICATE response data for OP-TEE
+ * TEE_CALL response for OP-TEE (RPMI spec section 4.16, Table 219)
  *
  * Response format (packed, per RPMI spec):
- *   Word 0:      RPMI STATUS (s32)
- *   Words 1+:    a0-a3 (XLEN-sized little-endian)
+ *   Word 0:      STATUS (s32)
+ *   Word 1:      SERVICE_RSP_LEN (u32)
+ *   Words 2+:    SERVICE_RSP = a0-a3 (XLEN-sized little-endian)
  *
- * For RV64: 4 + 4*8 = 36 bytes (packed, no padding after status)
- * For RV32: 4 + 4*4 = 20 bytes
+ * For RV64: 4 + 4 + 4*8 = 40 bytes
+ * For RV32: 4 + 4 + 4*4 = 24 bytes
  *
- * Must use __packed to prevent compiler from inserting padding after status.
+ * a0 is already stripped by the OpenSBI OP-TEE dispatcher; the four registers
+ * here are the OP-TEE return values a0-a3.
+ *
+ * Must use __packed to prevent padding between the header words and the regs.
  */
 struct rpmi_tee_optee_resp {
 	__le32 status;
+	__le32 service_rsp_len;
 	rpmi_xlen_t a0;
 	rpmi_xlen_t a1;
 	rpmi_xlen_t a2;
@@ -147,14 +175,16 @@ static inline int __mpxy_mbox_send_message(struct rpmi_mbox_message *msg)
 }
 
 /**
- * optee_riscv_sbi_mpxy() - Invoke OP-TEE via RPMI TEE_COMMUNICATE
+ * optee_riscv_sbi_mpxy() - Invoke OP-TEE via RPMI TEE_CALL (0x13)
  *
  * This function sends an SMC-style request to OP-TEE using the RPMI
- * TEE Service Group. Request contains 8 XLEN-sized registers (a0-a7),
- * response contains RPMI status + 4 XLEN-sized registers (a0-a3).
+ * TEE Service Group (0x0010). The TEE_CALL request wraps the 8 XLEN-sized
+ * registers (a0-a7) as SERVICE_DATA behind a fixed REE->OP-TEE identity and
+ * the well-known OP-TEE service UUID; the response carries STATUS +
+ * SERVICE_RSP_LEN + 4 XLEN-sized registers (a0-a3).
  *
- * Request size:  8 * sizeof(unsigned long) = 64 bytes (RV64) or 32 bytes (RV32)
- * Response size: 4 + 4 * sizeof(unsigned long) = 36 bytes (RV64) or 20 bytes (RV32)
+ * Request size:  28 + 8 * sizeof(unsigned long) = 92 bytes (RV64)
+ * Response size:  8 + 4 * sizeof(unsigned long) = 40 bytes (RV64)
  */
 static void optee_riscv_sbi_mpxy(unsigned long a0, unsigned long a1,
 				 unsigned long a2, unsigned long a3,
@@ -163,6 +193,11 @@ static void optee_riscv_sbi_mpxy(unsigned long a0, unsigned long a1,
 				 struct optee_conduit_res *res)
 {
 	struct rpmi_tee_optee_req tx = {
+		.sender_id = cpu_to_le32(RPMI_TEE_ENDPOINT_REE),
+		.target_id = cpu_to_le32(RPMI_TEE_ENDPOINT_OPTEE),
+		.service_data_len =
+			cpu_to_le32(RPMI_TEE_OPTEE_COMM_REQ_REGS *
+				    sizeof(rpmi_xlen_t)),
 		.a0 = cpu_to_rpmi_xlen(a0), .a1 = cpu_to_rpmi_xlen(a1),
 		.a2 = cpu_to_rpmi_xlen(a2), .a3 = cpu_to_rpmi_xlen(a3),
 		.a4 = cpu_to_rpmi_xlen(a4), .a5 = cpu_to_rpmi_xlen(a5),
@@ -172,7 +207,9 @@ static void optee_riscv_sbi_mpxy(unsigned long a0, unsigned long a1,
 	struct rpmi_mbox_message msg = {0};
 	int ret;
 
-	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_COMMUNICATE,
+	memcpy(tx.service, rpmi_tee_optee_service_uuid, sizeof(tx.service));
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_TEE_CALL,
 					  &tx, sizeof(tx), &rx, sizeof(rx));
 	ret = __mpxy_mbox_send_message(&msg);
 	if (ret) {
