@@ -597,6 +597,68 @@ static void riscv_mpxy_tee_parcel_selftest(void)
 	pr_info("PARCEL selftest done\n");
 }
 
+/*
+ * OP-TEE fast-call ABI id for parcel consumption. Mirrors the OP-TEE core
+ * definition OPTEE_ABI_CONSUME_PARCEL = FAST_CALL | (TRUSTED_OS << 24) | func:
+ *   0x80000000 | (50 << 24) | 0x100 = 0xB2000100.
+ */
+#define OPTEE_ABI_CONSUME_PARCEL	0xB2000100U
+
+/*
+ * End-to-end parcel consumption: create a parcel over a REE page, ask OP-TEE
+ * (via the TEE_CALL fast path) to accept it, map it, and write a known pattern
+ * into the shared memory, then read the page back in the REE and confirm the
+ * TEE actually touched it. OP-TEE releases the parcel inside the call, so the
+ * REE only needs to reclaim the handle afterwards.
+ */
+static void riscv_mpxy_tee_parcel_consume_selftest(void)
+{
+	const u32 rw = RPMI_TEE_PARCEL_ACCESS_R | RPMI_TEE_PARCEL_ACCESS_W;
+	const u32 nonce = 0x6000;
+	const u32 pattern = 0xdeadbeefU;
+	struct optee_conduit_res res = {0};
+	unsigned long va;
+	u64 page;
+	u32 readback;
+	u32 id;
+	int st;
+
+	va = __get_free_pages(GFP_KERNEL, 0); /* 1 page */
+	if (!va) {
+		pr_info("PARCEL consume: page allocation failed\n");
+		return;
+	}
+	memset((void *)va, 0, PAGE_SIZE);
+	page = (u64)virt_to_phys((void *)va) >> 12;
+
+	st = parcel_do_create(nonce, rw, rw, 0, page, 1, &id);
+	pr_info("PARCEL consume create status=%d id=0x%x (expect 0)\n", st, id);
+	if (st == 0) {
+		/*
+		 * TEE_CALL forwards the full a0-a7 block (the TEE MPXY channel
+		 * uses a PAGE_SIZE message buffer), so a1-a4 would work too; the
+		 * four 32-bit consume arguments are packed into a1/a2 by choice
+		 * to keep the request compact:
+		 *   a1 = parcel_id      | (nonce   << 32)
+		 *   a2 = creator_access | (pattern << 32)
+		 */
+		optee_riscv_sbi_mpxy(OPTEE_ABI_CONSUME_PARCEL,
+				     (u64)id | ((u64)nonce << 32),
+				     (u64)rw | ((u64)pattern << 32),
+				     0, 0, 0, 0, 0, &res);
+		readback = *(volatile u32 *)va;
+		pr_info("PARCEL consume tee status=%lu echo=0x%llx (expect 0)\n",
+			res.a0, (u64)res.a1);
+		pr_info("PARCEL consume readback=0x%x pattern=0x%x match=%d\n",
+			readback, pattern, readback == pattern);
+		st = parcel_do_reclaim(id);
+		pr_info("PARCEL consume reclaim status=%d (expect 0)\n", st);
+	}
+
+	free_pages(va, 0);
+	pr_info("PARCEL consume selftest done\n");
+}
+
 static int riscv_mpxy_mbox_probe(struct device *dev)
 {
         struct rpmi_mbox_message msg;
@@ -695,6 +757,9 @@ static int riscv_mpxy_mbox_probe(struct device *dev)
 
         /* Exercise the framework-answered memory parcel lifecycle. */
         riscv_mpxy_tee_parcel_selftest();
+
+        /* Exercise end-to-end OP-TEE-side parcel consumption. */
+        riscv_mpxy_tee_parcel_consume_selftest();
 
         return 0;
 
