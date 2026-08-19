@@ -32,9 +32,29 @@ static struct mpxy_tee_context *context;
 /** RPMI TEE ServiceGroup Service IDs */
 enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
-	RPMI_TEE_SRV_GET_ATTRIBUTES = 0x02,
+	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
 	RPMI_TEE_SRV_COMMUNICATE = 0x03,
 	RPMI_TEE_SRV_MAX_COUNT,
+};
+
+/** RPMI TEE feature IDs for TEE_PROBE_FEATURES (must match OpenSBI) */
+enum rpmi_tee_feature_id {
+	RPMI_TEE_FEAT_MEMORY_DONATE = 1,
+	RPMI_TEE_FEAT_MEMORY_LEND = 2,
+	RPMI_TEE_FEAT_MEMORY_SHARE = 3,
+	RPMI_TEE_FEAT_SIGNAL_BUS = 4,
+	RPMI_TEE_FEAT_MULTISEGMENT_OPS = 5,
+	RPMI_TEE_FEAT_SYSINFO_FORMAT = 6,
+};
+
+/** TEE_PROBE_FEATURES request / response (must match OpenSBI) */
+struct rpmi_tee_probe_features_req {
+	__le32 feature_id;
+};
+
+struct rpmi_tee_probe_features_resp {
+	__le32 status;
+	__le32 value;
 };
 
 /** TEE Implementation IDs */
@@ -179,6 +199,62 @@ static void optee_riscv_sbi_mpxy(unsigned long a0, unsigned long a1,
 	res->a3 = rpmi_xlen_to_cpu(rx.a3);
 }
 
+/*
+ * Log the framework-answered TEE services (TEE_PROBE_FEATURES and
+ * TEE_ENABLE_NOTIFICATION) at probe time. This proves the request/response
+ * marshalling end-to-end independently of any OP-TEE domain switch.
+ */
+static void riscv_mpxy_tee_probe_features(void)
+{
+	static const char * const feat_name[] = {
+		[RPMI_TEE_FEAT_MEMORY_DONATE]	= "MEMORY_DONATE",
+		[RPMI_TEE_FEAT_MEMORY_LEND]	= "MEMORY_LEND",
+		[RPMI_TEE_FEAT_MEMORY_SHARE]	= "MEMORY_SHARE",
+		[RPMI_TEE_FEAT_SIGNAL_BUS]	= "SIGNAL_BUS",
+		[RPMI_TEE_FEAT_MULTISEGMENT_OPS] = "MULTISEGMENT_OPS",
+		[RPMI_TEE_FEAT_SYSINFO_FORMAT]	= "SYSINFO_FORMAT",
+	};
+	struct rpmi_mbox_message msg;
+	u32 id;
+	int ret;
+
+	for (id = RPMI_TEE_FEAT_MEMORY_DONATE;
+	     id <= RPMI_TEE_FEAT_SYSINFO_FORMAT; id++) {
+		struct rpmi_tee_probe_features_req tx = {
+			.feature_id = cpu_to_le32(id),
+		};
+		struct rpmi_tee_probe_features_resp rx = {0};
+
+		rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_PROBE_FEATURES,
+						  &tx, sizeof(tx), &rx, sizeof(rx));
+		ret = __mpxy_mbox_send_message(&msg);
+		if (ret) {
+			pr_info("PROBE_FEATURES[%u %s] send failed: %d\n",
+				id, feat_name[id], ret);
+			continue;
+		}
+		pr_info("PROBE_FEATURES[%u %s] status=%d value=%u\n",
+			id, feat_name[id], le32_to_cpu(rx.status),
+			le32_to_cpu(rx.value));
+	}
+
+	/* TEE_ENABLE_NOTIFICATION: no events in this group -> expect NOTSUPP */
+	{
+		struct rpmi_tee_probe_features_resp rx = {0};
+
+		rpmi_mbox_init_send_with_response(&msg,
+						  RPMI_TEE_SRV_ENABLE_NOTIFICATION,
+						  NULL, 0, &rx, sizeof(rx));
+		ret = __mpxy_mbox_send_message(&msg);
+		if (ret)
+			pr_info("ENABLE_NOTIFICATION send failed: %d\n",
+				ret);
+		else
+			pr_info("ENABLE_NOTIFICATION status=%d (expect NOTSUPP=-2)\n",
+				le32_to_cpu(rx.status));
+	}
+}
+
 static int riscv_mpxy_mbox_probe(struct device *dev)
 {
         struct rpmi_mbox_message msg;
@@ -271,6 +347,9 @@ static int riscv_mpxy_mbox_probe(struct device *dev)
                 goto fail_free_channel;
         }
         context->max_msg_data_size = msg.attr.value;
+
+        /* Log framework-answered TEE services (PROBE_FEATURES / notify) */
+        riscv_mpxy_tee_probe_features();
 
         return 0;
 
