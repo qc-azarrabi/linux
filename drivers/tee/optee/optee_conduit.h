@@ -48,4 +48,22 @@ static inline optee_invoke_fn *arch_get_invoke_func(struct device *dev)
 
 #endif /* CONFIG_HAVE_ARM_SMCCC || CONFIG_RISCV_SBI_MPXY_MBOX */
 
+struct optee;
+
+#if defined(CONFIG_RISCV_SBI_MPXY_MBOX)
+
+int optee_riscv_enable_async_notif(struct optee *optee);
+void optee_riscv_disable_async_notif(void);
+
+#else
+
+static inline int optee_riscv_enable_async_notif(struct optee *optee)
+{
+	return -ENODEV;
+}
+
+static inline void optee_riscv_disable_async_notif(void) { }
+
+#endif /* CONFIG_RISCV_SBI_MPXY_MBOX */
+
 #endif /* OPTEE_CONDUIT_H */

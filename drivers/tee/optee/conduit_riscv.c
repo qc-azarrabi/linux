@@ -12,9 +12,11 @@
 #include <linux/platform_device.h>
 #include <linux/gfp.h>
 #include <linux/mm.h>
+#include <linux/workqueue.h>
 #include <asm/sbi.h>
 #include <asm/smp.h>
 #include "optee_conduit.h"
+#include "optee_private.h"
 #include "optee_smc.h"
 
 struct mpxy_tee_context {
@@ -22,6 +24,10 @@ struct mpxy_tee_context {
 	struct mbox_chan **chan;
 	struct mbox_client client;
 	u32 max_msg_data_size;
+	/* Async-notif signal-bus polling state (see optee_riscv_*_async_notif). */
+	struct optee *optee;
+	struct delayed_work notif_poll;
+	bool notif_active;
 };
 
 static struct mpxy_tee_context *context;
@@ -36,6 +42,10 @@ enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
 	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
 	RPMI_TEE_SRV_PROBE_SYSTEM = 0x03,
+	RPMI_TEE_SRV_SIGNAL_BUS_SETUP = 0x05,
+	RPMI_TEE_SRV_SIGNAL_BUS_TEARDOWN = 0x06,
+	RPMI_TEE_SRV_SIGNAL_RAISE = 0x07,
+	RPMI_TEE_SRV_SIGNAL_RETRIEVE = 0x08,
 	RPMI_TEE_SRV_MEM_PARCEL_CREATE = 0x09,
 	RPMI_TEE_SRV_MEM_PARCEL_ACCEPT = 0x0A,
 	RPMI_TEE_SRV_MEM_PARCEL_RELEASE = 0x0B,
@@ -217,6 +227,45 @@ enum rpmi_tee_impl_id {
  */
 #define RPMI_TEE_ENDPOINT_REE		0
 #define RPMI_TEE_ENDPOINT_OPTEE	1
+
+/*
+ * RPMI TEE signal-bus wire structs (RPMI spec section 4.16.7-4.16.10). These
+ * MUST byte-match the OpenSBI definitions in <sbi_utils/mailbox/rpmi_msgprot.h>.
+ * The async-notif doorbell uses a width-1 REE<->OP-TEE bus: OP-TEE raises
+ * signal 0 (target=REE), the REE reads it via SIGNAL_RETRIEVE and drains the
+ * actual notif values through the existing GET_ASYNC_NOTIF_VALUE fast-call.
+ */
+#define RPMI_TEE_SIGNAL_ASYNC_NOTIF	0
+#define RPMI_TEE_SIGNAL_RETRIEVE_MORE_AVAILABLE	(1U << 31)
+/* RPMI error status returned by SIGNAL_RETRIEVE when nothing is pending. */
+#define RPMI_ERR_NO_DATA		(-14)
+
+struct rpmi_tee_signal_bus_setup_req {
+	__le32 target_id;
+	__le32 bus_width;	/* M: total signals on the bus */
+	__le32 sender_signals;	/* N: signals reserved for sender to receive */
+};
+
+struct rpmi_tee_signal_bus_setup_resp {
+	__le32 status;
+};
+
+struct rpmi_tee_signal_bus_teardown_req {
+	__le32 target_id;
+};
+
+struct rpmi_tee_signal_bus_teardown_resp {
+	__le32 status;
+};
+
+/* SIGNAL_RETRIEVE request has no parameters. */
+struct rpmi_tee_signal_retrieve_resp {
+	__le32 status;
+	__le32 flags;		/* bit31 MORE_AVAILABLE; bits30:0 reserved 0 */
+	__le32 target_id;
+	__le32 signal_len;	/* N: length of signal[]; nonzero on success */
+	__le32 signal[];	/* active signals on this bus */
+};
 
 static const u8 rpmi_tee_optee_service_uuid[16] = {
 	0x5b, 0xe1, 0xb1, 0xa0, 0x7e, 0x11, 0x4e, 0x7a,
@@ -1061,6 +1110,139 @@ static void riscv_mpxy_tee_parcel_consume_selftest(void)
 
 	free_pages(va, 0);
 	pr_info("PARCEL consume selftest done\n");
+}
+
+/*
+ * Async-notif signal-bus support (polling prototype).
+ *
+ * OP-TEE raises signal 0 on the width-1 REE<->OP-TEE bus (a doorbell). Since
+ * the TEE service group defines no RPMI notification events, the REE learns of
+ * the raised signal by POLLING TEE_SIGNAL_RETRIEVE (0x08); on signal 0 it runs
+ * the standard OP-TEE async-notif drain (optee_notif_from_signal ->
+ * GET_ASYNC_NOTIF_VALUE loop). Under MSI/SYSIRQ (future) the same drain would
+ * be triggered from an IRQ handler instead of this poll timer.
+ */
+#define MPXY_TEE_NOTIF_POLL_INTERVAL	msecs_to_jiffies(100)
+
+static int mpxy_tee_signal_bus_setup(u32 width, u32 sender_signals)
+{
+	struct rpmi_tee_signal_bus_setup_req tx = {
+		.target_id = cpu_to_le32(RPMI_TEE_ENDPOINT_OPTEE),
+		.bus_width = cpu_to_le32(width),
+		.sender_signals = cpu_to_le32(sender_signals),
+	};
+	struct rpmi_tee_signal_bus_setup_resp rx = {0};
+	struct rpmi_mbox_message msg;
+	int ret;
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_SIGNAL_BUS_SETUP,
+					  &tx, sizeof(tx), &rx, sizeof(rx));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret)
+		return ret;
+	if (le32_to_cpu(rx.status))
+		return -EIO;
+	return 0;
+}
+
+static void mpxy_tee_signal_bus_teardown(void)
+{
+	struct rpmi_tee_signal_bus_teardown_req tx = {
+		.target_id = cpu_to_le32(RPMI_TEE_ENDPOINT_OPTEE),
+	};
+	struct rpmi_tee_signal_bus_teardown_resp rx = {0};
+	struct rpmi_mbox_message msg;
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_SIGNAL_BUS_TEARDOWN,
+					  &tx, sizeof(tx), &rx, sizeof(rx));
+	__mpxy_mbox_send_message(&msg);
+}
+
+/*
+ * Drain the REE-readable pending signals. Sets *async_notif_pending if signal 0
+ * (the async-notif doorbell) was among them. Returns 0 on success (including the
+ * empty NO_DATA case), negative on transport/RPMI error.
+ */
+static int mpxy_tee_signal_retrieve(bool *async_notif_pending)
+{
+	u8 buf[sizeof(struct rpmi_tee_signal_retrieve_resp) + sizeof(__le32)] = {0};
+	struct rpmi_tee_signal_retrieve_resp *rx = (void *)buf;
+	struct rpmi_mbox_message msg;
+	int ret, status;
+	u32 n, i;
+
+	*async_notif_pending = false;
+
+	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_SIGNAL_RETRIEVE,
+					  NULL, 0, buf, sizeof(buf));
+	ret = __mpxy_mbox_send_message(&msg);
+	if (ret)
+		return ret;
+
+	status = le32_to_cpu(rx->status);
+	if (status == RPMI_ERR_NO_DATA)
+		return 0;			/* nothing pending */
+	if (status)
+		return -EIO;
+
+	n = le32_to_cpu(rx->signal_len);
+	/* Width-1 bus: at most signal[0] fits in buf. */
+	for (i = 0; i < n && i < 1; i++)
+		if (le32_to_cpu(rx->signal[i]) == RPMI_TEE_SIGNAL_ASYNC_NOTIF)
+			*async_notif_pending = true;
+	return 0;
+}
+
+static void mpxy_tee_notif_poll_work(struct work_struct *work)
+{
+	struct mpxy_tee_context *ctx = container_of(to_delayed_work(work),
+						    struct mpxy_tee_context,
+						    notif_poll);
+	bool pending = false;
+
+	if (!mpxy_tee_signal_retrieve(&pending) && pending)
+		optee_notif_from_signal(ctx->optee);
+
+	if (READ_ONCE(ctx->notif_active))
+		schedule_delayed_work(&ctx->notif_poll,
+				      MPXY_TEE_NOTIF_POLL_INTERVAL);
+}
+
+/*
+ * Establish the width-1 async-notif signal bus and start the RETRIEVE poll
+ * loop. Called from the optee_abi.c async-notif init once OP-TEE has advertised
+ * SEC_CAP_ASYNC_NOTIF. Returns -ENODEV if the RISC-V mpxy conduit is not the
+ * active transport (so the caller can fall back to the DT-interrupt path).
+ */
+int optee_riscv_enable_async_notif(struct optee *optee)
+{
+	int ret;
+
+	if (!context)
+		return -ENODEV;
+
+	ret = mpxy_tee_signal_bus_setup(1, 1);
+	if (ret) {
+		dev_err(context->dev,
+			"async-notif: SIGNAL_BUS_SETUP failed: %d\n", ret);
+		return ret;
+	}
+
+	context->optee = optee;
+	INIT_DELAYED_WORK(&context->notif_poll, mpxy_tee_notif_poll_work);
+	WRITE_ONCE(context->notif_active, true);
+	schedule_delayed_work(&context->notif_poll, MPXY_TEE_NOTIF_POLL_INTERVAL);
+	return 0;
+}
+
+void optee_riscv_disable_async_notif(void)
+{
+	if (!context || !READ_ONCE(context->notif_active))
+		return;
+
+	WRITE_ONCE(context->notif_active, false);
+	cancel_delayed_work_sync(&context->notif_poll);
+	mpxy_tee_signal_bus_teardown();
 }
 
 static int riscv_mpxy_mbox_probe(struct device *dev)

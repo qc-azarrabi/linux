@@ -1073,6 +1073,18 @@ static irqreturn_t irq_handler(struct optee *optee)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Async-notif entry point for the RISC-V mpxy conduit. The conduit's signal-bus
+ * poll (or, later, an MSI IRQ) calls this when OP-TEE has raised the async-notif
+ * doorbell. Unlike the SMC IRQ path there is no threaded-IRQ context here, so we
+ * run the drain and, if a bottom half was requested, invoke it directly.
+ */
+void optee_notif_from_signal(struct optee *optee)
+{
+	if (irq_handler(optee) == IRQ_WAKE_THREAD)
+		optee_do_bottom_half(optee->ctx);
+}
+
 static irqreturn_t notif_irq_handler(int irq, void *dev_id)
 {
 	struct optee *optee = dev_id;
@@ -1830,16 +1842,28 @@ static int optee_probe(struct platform_device *pdev)
 	if (sec_caps & OPTEE_SMC_SEC_CAP_ASYNC_NOTIF) {
 		unsigned int irq;
 
-		rc = platform_get_irq(pdev, 0);
-		if (rc < 0) {
-			pr_err("platform_get_irq: ret %d\n", rc);
-			goto err_notif_uninit;
-		}
-		irq = rc;
+		/*
+		 * On the RISC-V mpxy conduit the optee node has no DT
+		 * "interrupts": OP-TEE's async-notif doorbell arrives over the
+		 * RPMI TEE signal bus. Set that up first; only fall back to the
+		 * DT-interrupt (SMC/GIC) path when the mpxy conduit is absent.
+		 */
+		rc = optee_riscv_enable_async_notif(optee);
+		if (rc == -ENODEV) {
+			rc = platform_get_irq(pdev, 0);
+			if (rc < 0) {
+				pr_err("platform_get_irq: ret %d\n", rc);
+				goto err_notif_uninit;
+			}
+			irq = rc;
 
-		rc = optee_smc_notif_init_irq(optee, irq);
-		if (rc) {
-			irq_dispose_mapping(irq);
+			rc = optee_smc_notif_init_irq(optee, irq);
+			if (rc) {
+				irq_dispose_mapping(irq);
+				goto err_notif_uninit;
+			}
+		} else if (rc) {
+			pr_err("async-notif signal-bus setup: ret %d\n", rc);
 			goto err_notif_uninit;
 		}
 		enable_async_notif(optee->smc.invoke_fn);
