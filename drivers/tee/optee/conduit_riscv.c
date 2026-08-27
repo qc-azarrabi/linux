@@ -8,6 +8,7 @@
 
 #include <linux/mailbox/riscv-rpmi-message.h>
 #include <linux/mailbox_client.h>
+#include <linux/interrupt.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/gfp.h>
@@ -28,6 +29,14 @@ struct mpxy_tee_context {
 	struct optee *optee;
 	struct delayed_work notif_poll;
 	bool notif_active;
+	/*
+	 * Hardware MSI wakeup for the async-notif doorbell. When the signal-bus
+	 * System MSI (TEE_SIGNAL_MSI_INDEX, delivered via the rpmi_sysmsi MSI
+	 * domain and carried as the optee node's DT "interrupts") is armed, the
+	 * IRQ replaces the periodic poll; notif_irq < 0 means poll-only.
+	 */
+	int notif_irq;
+	bool notif_msi_armed;
 };
 
 static struct mpxy_tee_context *context;
@@ -1203,9 +1212,27 @@ static void mpxy_tee_notif_poll_work(struct work_struct *work)
 	if (!mpxy_tee_signal_retrieve(&pending) && pending)
 		optee_notif_from_signal(ctx->optee);
 
-	if (READ_ONCE(ctx->notif_active))
+	/*
+	 * Reschedule only in poll mode. When the System MSI is armed the drain
+	 * is edge-driven from the IRQ handler, so the work must not re-arm the
+	 * periodic timer.
+	 */
+	if (READ_ONCE(ctx->notif_active) && !ctx->notif_msi_armed)
 		schedule_delayed_work(&ctx->notif_poll,
 				      MPXY_TEE_NOTIF_POLL_INTERVAL);
+}
+
+/*
+ * Signal-bus System MSI handler. The MSI is only the "signals available" poke;
+ * the actual drain (TEE_SIGNAL_RETRIEVE) issues mailbox calls that may sleep,
+ * so kick the shared work item to run immediately in process context.
+ */
+static irqreturn_t mpxy_tee_notif_msi_handler(int irq, void *dev_id)
+{
+	struct mpxy_tee_context *ctx = dev_id;
+
+	mod_delayed_work(system_wq, &ctx->notif_poll, 0);
+	return IRQ_HANDLED;
 }
 
 /*
@@ -1216,7 +1243,7 @@ static void mpxy_tee_notif_poll_work(struct work_struct *work)
  */
 int optee_riscv_enable_async_notif(struct optee *optee)
 {
-	int ret;
+	int ret, irq;
 
 	if (!context)
 		return -ENODEV;
@@ -1229,9 +1256,43 @@ int optee_riscv_enable_async_notif(struct optee *optee)
 	}
 
 	context->optee = optee;
+	context->notif_irq = -1;
+	context->notif_msi_armed = false;
 	INIT_DELAYED_WORK(&context->notif_poll, mpxy_tee_notif_poll_work);
 	WRITE_ONCE(context->notif_active, true);
-	schedule_delayed_work(&context->notif_poll, MPXY_TEE_NOTIF_POLL_INTERVAL);
+
+	/*
+	 * Prefer the hardware MSI wakeup. The signal-bus doorbell is delivered
+	 * as an RPMI System MSI at TEE_SIGNAL_MSI_INDEX (advertised in the
+	 * SIGNAL_BUS feature word); the optee node carries it as DT
+	 * "interrupts = <0>" under interrupt-parent = <&rpmi_sysmsi>. If the
+	 * MSI is available, arm it and drop the periodic poll; otherwise fall
+	 * back to polling.
+	 */
+	irq = platform_get_irq_optional(to_platform_device(context->dev), 0);
+	if (irq > 0) {
+		ret = request_irq(irq, mpxy_tee_notif_msi_handler, 0,
+				  "optee-tee-signal", context);
+		if (ret) {
+			dev_warn(context->dev,
+				 "async-notif: MSI request_irq failed (%d), polling\n",
+				 ret);
+		} else {
+			context->notif_irq = irq;
+			context->notif_msi_armed = true;
+			dev_info(context->dev,
+				 "async-notif: System MSI armed (irq %d)\n", irq);
+		}
+	}
+
+	/*
+	 * Kick an immediate drain either way: in MSI mode it catches any signal
+	 * already pending before the IRQ was armed; in poll mode it starts the
+	 * periodic loop.
+	 */
+	schedule_delayed_work(&context->notif_poll,
+			      context->notif_msi_armed ?
+			      0 : MPXY_TEE_NOTIF_POLL_INTERVAL);
 	return 0;
 }
 
@@ -1241,6 +1302,11 @@ void optee_riscv_disable_async_notif(void)
 		return;
 
 	WRITE_ONCE(context->notif_active, false);
+	if (context->notif_irq > 0) {
+		free_irq(context->notif_irq, context);
+		context->notif_irq = -1;
+		context->notif_msi_armed = false;
+	}
 	cancel_delayed_work_sync(&context->notif_poll);
 	mpxy_tee_signal_bus_teardown();
 }

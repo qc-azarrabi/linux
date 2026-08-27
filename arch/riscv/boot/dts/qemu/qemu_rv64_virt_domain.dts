@@ -192,11 +192,48 @@
 		#mbox-cells = <2>;
 	};
 
+	/* OpenSBI-side in-framework mailbox controller that answers the RPMI
+	 * SYSTEM_MSI (0x0002) services directly (no external microcontroller
+	 * under QEMU). The SYSTEM_MSI MPXY proxy below forwards to it. Consumed
+	 * by OpenSBI only; Linux ignores this node. */
+	sysmsi_mbox: rpmi-sysmsi-mbox {
+		compatible = "riscv,rpmi-sysmsi-mbox";
+		#mbox-cells = <0x01>;
+	};
+
+	/* OpenSBI-side SYSTEM_MSI (0x0002) MPXY provider channel. The proxy
+	 * forwards SYSTEM_MSI services to the in-framework sysmsi_mbox
+	 * controller (mailbox cell = RPMI SYSTEM_MSI service group id 0x2). */
+	sbi-mpxy-system-msi {
+		compatible = "riscv,rpmi-mpxy-system-msi";
+		riscv,sbi-mpxy-channel-id = <0x20>;
+		mboxes = <&sysmsi_mbox 0x02>;
+	};
+
+	/* Linux-side System MSI controller: allocates MSIs from the S-mode
+	 * IMSIC and programs their targets in OpenSBI via SET_MSI_TARGET over
+	 * SYSTEM_MSI MPXY channel 0x20. Downstream consumers (the optee
+	 * conduit's signal-bus doorbell) point their msi-parent at this node. */
+	rpmi_sysmsi: rpmi-system-msi {
+		compatible = "riscv,rpmi-system-msi";
+		mboxes = <&mpxy_mbox 0x20 0x00>;
+		msi-parent = <&imsic_s>;
+		interrupt-controller;
+		#interrupt-cells = <0x01>;
+	};
+
 	firmware {
 		optee {
 			compatible = "linaro,optee-tz";
 			method = "mpxy";
 			mboxes = <&mpxy_mbox 0x00 0x00>, <&mpxy_mbox 0x01 0x00>;
+			/* Async-notif doorbell: the OP-TEE -> REE "signals
+			 * available" poke arrives as an RPMI System MSI at
+			 * TEE_SIGNAL_MSI_INDEX (0), allocated from the
+			 * rpmi_sysmsi MSI domain. The conduit requests it via
+			 * platform_get_irq() and drains TEE_SIGNAL_RETRIEVE. */
+			interrupt-parent = <&rpmi_sysmsi>;
+			interrupts = <0x00>;
 		};
 	};
 
