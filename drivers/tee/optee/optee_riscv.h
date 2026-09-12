@@ -175,9 +175,14 @@ struct rpmi_tee_probe_features_resp {
 	{ 0x5b, 0xe1, 0xb1, 0xa0, 0x7e, 0x11, 0x4e, 0x7a,		\
 	  0x9b, 0x10, 0x00, 0x10, 0xc0, 0xff, 0xee, 0x00 }
 
-/* OP-TEE SMC-style call convention carried inside SERVICE_DATA. */
-#define RPMI_TEE_OPTEE_CALL_REGS	8	/* a0-a7 */
-#define RPMI_TEE_OPTEE_RESP_REGS	4	/* a0-a3 */
+/*
+ * OP-TEE FF-A direct message convention carried inside SERVICE_DATA:
+ * four command words each way, the RISC-V analog of the FF-A
+ * data0-data3 (w3-w6) pair of struct ffa_send_direct_data; the fifth
+ * FF-A word, data4/w7, is never used by OP-TEE and has no analog here.
+ */
+#define RPMI_TEE_OPTEE_CALL_REGS	4
+#define RPMI_TEE_OPTEE_RESP_REGS	4
 
 #if __riscv_xlen == 64
 typedef __le64 rpmi_xlen_t;

@@ -78,8 +78,10 @@ static int optee_riscv_send(struct optee *optee, struct rpmi_mbox_message *msg)
 /*
  * optee_riscv_tee_call() - issue a TEE_CALL (RPMI service 0x13)
  * @optee:	main service struct
- * @in:		the four command words carried in SERVICE_DATA (a0-a3 analog)
- * @out:	the four response words returned in SERVICE_RSP (a0-a3)
+ * @in:		the command words carried in SERVICE_DATA, the RISC-V analog
+ *		of struct ffa_send_direct_data's data0-data3 (w3-w6)
+ * @out:	the response words returned in SERVICE_RSP, the RISC-V analog
+ *		of the same data0-data3 pair on the return path
  *
  * TEE_CALL is the RISC-V analog of the FF-A direct message: it is the single
  * doorbell used both for the blocking (fast) calls of section 6 and for the
@@ -89,8 +91,9 @@ static int optee_riscv_send(struct optee *optee, struct rpmi_mbox_message *msg)
  *
  * Returns 0 on success or <0 on failure.
  */
-static int optee_riscv_tee_call(struct optee *optee, const u64 in[4],
-				u64 out[4])
+static int optee_riscv_tee_call(struct optee *optee,
+				const u64 in[RPMI_TEE_OPTEE_CALL_REGS],
+				u64 out[RPMI_TEE_OPTEE_RESP_REGS])
 {
 	static const u8 optee_uuid[RPMI_TEE_UUID_LEN] = RPMI_TEE_OPTEE_UUID;
 	struct rpmi_tee_call_req tx = {
@@ -106,7 +109,7 @@ static int optee_riscv_tee_call(struct optee *optee, const u64 in[4],
 	int ret;
 
 	memcpy(tx.service, optee_uuid, sizeof(tx.service));
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < RPMI_TEE_OPTEE_CALL_REGS; i++)
 		tx.reg[i] = cpu_to_rpmi_xlen(in[i]);
 
 	rpmi_mbox_init_send_with_response(&msg, RPMI_TEE_SRV_CALL,
