@@ -20,8 +20,7 @@ description: |
   Linux) are peer endpoints and the RPMI framework (machine mode firmware)
   mediates every message. Entering OP-TEE on a hart runs it on that hart until
   it responds, so the SBI implementation provides one SBI MPXY channel per
-  hart and a node is described per CPU as a child of the corresponding CPU
-  node.
+  hart; all of them are listed, in hart order, on a single node.
 
   ===========================================
   References
@@ -37,11 +36,11 @@ properties:
   compatible:
     const: riscv,rpmi-mpxy-tee
 
-  riscv,sbi-mpxy-channel-id:
-    $ref: /schemas/types.yaml#/definitions/uint32
+  mboxes:
+    minItems: 1
     description:
-      The SBI MPXY channel id used to reach the RPMI TEE service group for the
-      parent CPU.
+      One SBI MPXY channel implementing the RPMI TEE service group per hart,
+      listed in the same order as the CPU nodes.
 
   interrupts:
     maxItems: 1
@@ -52,27 +51,14 @@ properties:
 
 required:
   - compatible
-  - riscv,sbi-mpxy-channel-id
+  - mboxes
 
 additionalProperties: false
 
 examples:
   - |
-    cpus {
-        #address-cells = <1>;
-        #size-cells = <0>;
-
-        cpu@0 {
-            device_type = "cpu";
-            reg = <0x0>;
-            compatible = "riscv";
-            riscv,isa = "rv64imafdc";
-            mmu-type = "riscv,sv48";
-
-            tee {
-                compatible = "riscv,rpmi-mpxy-tee";
-                riscv,sbi-mpxy-channel-id = <0x10>;
-            };
-        };
+    tee {
+        compatible = "riscv,rpmi-mpxy-tee";
+        mboxes = <&mpxy_mbox 0x10 0x0>, <&mpxy_mbox 0x11 0x0>;
     };
 ...

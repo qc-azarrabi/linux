@@ -1236,60 +1236,39 @@ static const struct optee_ops optee_riscv_ops = {
 };
 
 /*
- * The RPMI TEE service group is described in the device tree as one
- * "riscv,rpmi-mpxy-tee" node per hart, each carrying a dedicated MPXY channel
- * id.  The driver requests one mailbox channel per hart and validates the
+ * The RPMI TEE service group is described in the device tree by a single
+ * node whose "mboxes" property lists one SBI MPXY channel per hart, in hart
+ * order.  The driver requests each list entry by index and validates the
  * transport before building the OP-TEE device.
  */
 
 static int optee_riscv_request_channels(struct optee *optee)
 {
 	struct device *dev = optee->riscv.dev;
-	struct device_node *np;
-	int ret;
+	int nr_mboxes;
+	unsigned int cpuid;
 
-	for_each_compatible_node(np, NULL, "riscv,rpmi-mpxy-tee") {
-		struct device_node *cpu_np;
-		u32 channel_id;
-		int cpuid;
+	nr_mboxes = of_count_phandle_with_args(dev->of_node, "mboxes",
+					       "#mbox-cells");
+	if (nr_mboxes != optee->riscv.nr_chan)
+		return dev_err_probe(dev, -EINVAL,
+				     "Expected %u mailbox channels, got %d\n",
+				     optee->riscv.nr_chan, nr_mboxes);
 
-		ret = of_property_read_u32(np, "riscv,sbi-mpxy-channel-id",
-					   &channel_id);
-		if (ret) {
-			dev_err(dev, "Missing channel id in %pOF\n", np);
-			goto err_put_np;
-		}
-
-		cpu_np = of_get_parent(np);
-		if (!cpu_np) {
-			ret = -EINVAL;
-			dev_err(dev, "Missing parent CPU node for %pOF\n", np);
-			goto err_put_np;
-		}
-		cpuid = of_cpu_node_to_id(cpu_np);
-		of_node_put(cpu_np);
-		if (cpuid < 0) {
-			ret = cpuid;
-			dev_err(dev, "Invalid parent CPU node for %pOF\n", np);
-			goto err_put_np;
-		}
-
+	for (cpuid = 0; cpuid < optee->riscv.nr_chan; cpuid++) {
 		optee->riscv.chan[cpuid] =
-			mbox_request_channel(optee->riscv.client, channel_id);
+			mbox_request_channel(optee->riscv.client, cpuid);
 		if (IS_ERR(optee->riscv.chan[cpuid])) {
-			ret = PTR_ERR(optee->riscv.chan[cpuid]);
+			int ret = PTR_ERR(optee->riscv.chan[cpuid]);
+
 			optee->riscv.chan[cpuid] = NULL;
-			dev_err(dev, "Failed to request channel %u: %d\n",
-				channel_id, ret);
-			goto err_put_np;
+			return dev_err_probe(dev, ret,
+					     "Failed to request channel %u\n",
+					     cpuid);
 		}
 	}
 
 	return 0;
-
-err_put_np:
-	of_node_put(np);
-	return ret;
 }
 
 static void optee_riscv_free_channels(struct optee *optee)
