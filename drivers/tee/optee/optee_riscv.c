@@ -34,7 +34,6 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/rhashtable.h>
 #include <linux/sched.h>
@@ -43,8 +42,6 @@
 #include <linux/string.h>
 #include <linux/tee_core.h>
 #include <linux/types.h>
-
-#include <asm/smp.h>
 
 #include "optee_private.h"
 #include "optee_riscv.h"
@@ -915,9 +912,7 @@ static bool optee_riscv_retrieve_signals(struct optee *optee)
 		if (status)
 			break;
 
-		n = le32_to_cpu(rx->signal_len);
-		if (n > max_signals)
-			n = max_signals;
+		n = min_t(u32, le32_to_cpu(rx->signal_len), max_signals);
 		for (i = 0; i < n; i++) {
 			u32 value = le32_to_cpu(rx->signal[i]);
 
@@ -1247,35 +1242,6 @@ static const struct optee_ops optee_riscv_ops = {
  * transport before building the OP-TEE device.
  */
 
-static int optee_riscv_count_cpus(void)
-{
-	int nr_cpus = 0;
-	int cpuid;
-
-	for (cpuid = 0; cpuid < NR_CPUS; cpuid++) {
-		unsigned long hartid = cpuid_to_hartid_map(cpuid);
-
-		if (hartid == INVALID_HARTID || hartid >= (unsigned long)NR_CPUS)
-			break;
-		nr_cpus++;
-	}
-
-	return nr_cpus;
-}
-
-static int optee_riscv_hartid_to_cpuid(unsigned long hartid,
-				       unsigned int nr_cpus)
-{
-	unsigned int cpuid;
-
-	for (cpuid = 0; cpuid < nr_cpus; cpuid++) {
-		if (cpuid_to_hartid_map(cpuid) == hartid)
-			return cpuid;
-	}
-
-	return -ENOENT;
-}
-
 static int optee_riscv_request_channels(struct optee *optee)
 {
 	struct device *dev = optee->riscv.dev;
@@ -1284,7 +1250,6 @@ static int optee_riscv_request_channels(struct optee *optee)
 
 	for_each_compatible_node(np, NULL, "riscv,rpmi-mpxy-tee") {
 		struct device_node *cpu_np;
-		u64 hartid, size;
 		u32 channel_id;
 		int cpuid;
 
@@ -1301,17 +1266,11 @@ static int optee_riscv_request_channels(struct optee *optee)
 			dev_err(dev, "Missing parent CPU node for %pOF\n", np);
 			goto err_put_np;
 		}
-		ret = of_property_read_reg(cpu_np, 0, &hartid, &size);
+		cpuid = of_cpu_node_to_id(cpu_np);
 		of_node_put(cpu_np);
-		if (ret) {
-			dev_err(dev, "Missing hartid for %pOF\n", np);
-			goto err_put_np;
-		}
-
-		cpuid = optee_riscv_hartid_to_cpuid(hartid, optee->riscv.nr_chan);
 		if (cpuid < 0) {
 			ret = cpuid;
-			dev_err(dev, "Invalid hartid %llu in %pOF\n", hartid, np);
+			dev_err(dev, "Invalid parent CPU node for %pOF\n", np);
 			goto err_put_np;
 		}
 
@@ -1453,10 +1412,11 @@ static int optee_riscv_probe(struct platform_device *pdev)
 	u32 arg_cache_flags = 0;
 	struct optee *optee;
 	u32 sec_caps;
-	int nr_cpus, rc;
+	unsigned int nr_cpus;
+	int rc;
 
-	nr_cpus = optee_riscv_count_cpus();
-	if (nr_cpus <= 0)
+	nr_cpus = num_possible_cpus();
+	if (!nr_cpus)
 		return dev_err_probe(dev, -ENODEV, "No harts found\n");
 
 	optee = kzalloc_obj(*optee);
