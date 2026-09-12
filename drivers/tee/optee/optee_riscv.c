@@ -79,9 +79,9 @@ static int optee_riscv_send(struct optee *optee, struct rpmi_mbox_message *msg)
  * optee_riscv_tee_call() - issue a TEE_CALL (RPMI service 0x13)
  * @optee:	main service struct
  * @in:		the command words carried in SERVICE_DATA, the RISC-V analog
- *		of struct ffa_send_direct_data's data0-data3 (w3-w6)
+ *		of struct ffa_send_direct_data's data0-data4 (w3-w7)
  * @out:	the response words returned in SERVICE_RSP, the RISC-V analog
- *		of the same data0-data3 pair on the return path
+ *		of the same data0-data4 set on the return path
  *
  * TEE_CALL is the RISC-V analog of the FF-A direct message: it is the single
  * doorbell used both for the blocking (fast) calls of section 6 and for the
@@ -531,13 +531,13 @@ static int optee_riscv_shm_unregister(struct tee_context *ctx,
 {
 	struct optee *optee = tee_get_drvdata(ctx->teedev);
 	u64 global_id = shm->sec_world_id;
-	u64 in[4] = {
+	u64 in[RPMI_TEE_OPTEE_CALL_REGS] = {
 		OPTEE_ABI_UNREGISTER_SHM,
 		(u32)global_id,
 		global_id >> 32,
 		0,
 	};
-	u64 out[4] = { };
+	u64 out[RPMI_TEE_OPTEE_RESP_REGS] = { };
 	int rc;
 
 	optee_shm_rem_riscv_handle(optee, global_id);
@@ -743,13 +743,14 @@ static void optee_handle_riscv_rpc(struct tee_context *ctx,
 	}
 }
 
-static int optee_riscv_yielding_call(struct tee_context *ctx, u64 in[4],
+static int optee_riscv_yielding_call(struct tee_context *ctx,
+				     u64 in[RPMI_TEE_OPTEE_CALL_REGS],
 				     struct optee_msg_arg *rpc_arg,
 				     bool system_thread)
 {
 	struct optee *optee = tee_get_drvdata(ctx->teedev);
 	struct optee_call_waiter w;
-	u64 out[4] = { };
+	u64 out[RPMI_TEE_OPTEE_RESP_REGS] = { };
 	int rc;
 
 	/* Initialize waiter */
@@ -782,13 +783,19 @@ static int optee_riscv_yielding_call(struct tee_context *ctx, u64 in[4],
 		if (out[1] == OPTEE_ABI_YIELDING_CALL_RETURN_DONE)
 			goto done;
 
-		/* OP-TEE has returned with an RPC request. */
+		/*
+		 * OP-TEE has returned with an RPC request.
+		 *
+		 * Note that out[4] (returned in reg[4]) is already filled in
+		 * by optee_riscv_tee_call() returning above.
+		 */
 		cond_resched();
 		optee_handle_riscv_rpc(ctx, optee, out[1], rpc_arg);
 		in[0] = OPTEE_ABI_YIELDING_CALL_RESUME;
 		in[1] = 0;
 		in[2] = 0;
-		in[3] = out[3];		/* resume info */
+		in[3] = 0;
+		in[4] = out[4];		/* resume info */
 	}
 done:
 	/*
@@ -818,7 +825,7 @@ static int optee_riscv_do_call_with_arg(struct tee_context *ctx,
 					struct tee_shm *shm, u_int offs,
 					bool system_thread)
 {
-	u64 in[4] = {
+	u64 in[RPMI_TEE_OPTEE_CALL_REGS] = {
 		OPTEE_ABI_YIELDING_CALL_WITH_ARG,
 		(u32)shm->sec_world_id,
 		shm->sec_world_id >> 32,
@@ -943,9 +950,9 @@ static irqreturn_t notif_irq_handler(int irq, void *dev_id)
  */
 static int optee_riscv_enable_async_notif(struct optee *optee)
 {
-	u64 in[4] = { OPTEE_ABI_ENABLE_ASYNC_NOTIF,
+	u64 in[RPMI_TEE_OPTEE_CALL_REGS] = { OPTEE_ABI_ENABLE_ASYNC_NOTIF,
 		      optee->riscv.bottom_half_value };
-	u64 out[4] = { };
+	u64 out[RPMI_TEE_OPTEE_RESP_REGS] = { };
 	int rc;
 
 	rc = optee_riscv_tee_call(optee, in, out);
@@ -1096,8 +1103,8 @@ static void optee_riscv_async_notif_uninit(struct optee *optee)
 
 static bool optee_riscv_api_is_compatible(struct optee *optee)
 {
-	u64 in[4] = { OPTEE_ABI_GET_API_VERSION };
-	u64 out[4] = { };
+	u64 in[RPMI_TEE_OPTEE_CALL_REGS] = { OPTEE_ABI_GET_API_VERSION };
+	u64 out[RPMI_TEE_OPTEE_RESP_REGS] = { };
 	int rc;
 
 	rc = optee_riscv_tee_call(optee, in, out);
@@ -1117,8 +1124,8 @@ static bool optee_riscv_api_is_compatible(struct optee *optee)
 
 static bool optee_riscv_get_os_revision(struct optee *optee)
 {
-	u64 in[4] = { OPTEE_ABI_GET_OS_VERSION };
-	u64 out[4] = { };
+	u64 in[RPMI_TEE_OPTEE_CALL_REGS] = { OPTEE_ABI_GET_OS_VERSION };
+	u64 out[RPMI_TEE_OPTEE_RESP_REGS] = { };
 	int rc;
 
 	rc = optee_riscv_tee_call(optee, in, out);
@@ -1144,8 +1151,8 @@ static bool optee_riscv_exchange_caps(struct optee *optee, u32 *sec_caps,
 				      unsigned int *rpc_param_count,
 				      unsigned int *max_notif_value)
 {
-	u64 in[4] = { OPTEE_ABI_EXCHANGE_CAPABILITIES };
-	u64 out[4] = { };
+	u64 in[RPMI_TEE_OPTEE_CALL_REGS] = { OPTEE_ABI_EXCHANGE_CAPABILITIES };
+	u64 out[RPMI_TEE_OPTEE_RESP_REGS] = { };
 	int rc;
 
 	rc = optee_riscv_tee_call(optee, in, out);

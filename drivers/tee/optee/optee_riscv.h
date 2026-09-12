@@ -177,12 +177,11 @@ struct rpmi_tee_probe_features_resp {
 
 /*
  * OP-TEE FF-A direct message convention carried inside SERVICE_DATA:
- * four command words each way, the RISC-V analog of the FF-A
- * data0-data3 (w3-w6) pair of struct ffa_send_direct_data; the fifth
- * FF-A word, data4/w7, is never used by OP-TEE and has no analog here.
+ * five command words each way, the RISC-V analog of the FF-A data0-data4
+ * (w3-w7) set of struct ffa_send_direct_data.
  */
-#define RPMI_TEE_OPTEE_CALL_REGS	4
-#define RPMI_TEE_OPTEE_RESP_REGS	4
+#define RPMI_TEE_OPTEE_CALL_REGS	5
+#define RPMI_TEE_OPTEE_RESP_REGS	5
 
 #if __riscv_xlen == 64
 typedef __le64 rpmi_xlen_t;
@@ -221,11 +220,13 @@ struct rpmi_tee_call_resp {
  *   reg[1]: shared memory handle, lower 32 bits (parcel id)
  *   reg[2]: shared memory handle, upper 32 bits (parcel nonce)
  *   reg[3]: offset into the shared memory to the struct optee_msg_arg
+ *   reg[4]: not used on this call, resume info on OPTEE_ABI_YIELDING_CALL_RESUME
  *
  * On return the SERVICE_RSP registers carry:
  *   reg[0]: error code, 0 on success
  *   reg[1]: return code (OPTEE_ABI_YIELDING_CALL_RETURN_* below)
- *   reg[2..3]: RPC resume info
+ *   reg[2..3]: not used
+ *   reg[4]: RPC resume info
  *
  * These MUST byte-match the secure world OP-TEE header.
  */
