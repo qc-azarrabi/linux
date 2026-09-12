@@ -749,10 +749,6 @@ static int optee_riscv_yielding_call(struct tee_context *ctx, u64 in[4],
 {
 	struct optee *optee = tee_get_drvdata(ctx->teedev);
 	struct optee_call_waiter w;
-	u32 cmd = in[0];
-	u32 w4 = in[1];
-	u32 w5 = in[2];
-	u32 w6 = in[3];
 	u64 out[4] = { };
 	int rc;
 
@@ -767,7 +763,7 @@ static int optee_riscv_yielding_call(struct tee_context *ctx, u64 in[4],
 		case TEEC_SUCCESS:
 			break;
 		case TEEC_ERROR_BUSY:
-			if (cmd == OPTEE_ABI_YIELDING_CALL_RESUME) {
+			if (in[0] == OPTEE_ABI_YIELDING_CALL_RESUME) {
 				rc = -EIO;
 				goto done;
 			}
@@ -777,10 +773,6 @@ static int optee_riscv_yielding_call(struct tee_context *ctx, u64 in[4],
 			 * to become available.
 			 */
 			optee_cq_wait_for_completion(&optee->call_queue, &w);
-			in[0] = cmd;
-			in[1] = w4;
-			in[2] = w5;
-			in[3] = w6;
 			continue;
 		default:
 			rc = -EIO;
@@ -793,8 +785,7 @@ static int optee_riscv_yielding_call(struct tee_context *ctx, u64 in[4],
 		/* OP-TEE has returned with an RPC request. */
 		cond_resched();
 		optee_handle_riscv_rpc(ctx, optee, out[1], rpc_arg);
-		cmd = OPTEE_ABI_YIELDING_CALL_RESUME;
-		in[0] = cmd;
+		in[0] = OPTEE_ABI_YIELDING_CALL_RESUME;
 		in[1] = 0;
 		in[2] = 0;
 		in[3] = out[3];		/* resume info */
