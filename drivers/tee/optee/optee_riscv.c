@@ -946,6 +946,29 @@ static irqreturn_t notif_irq_handler(int irq, void *dev_id)
 }
 
 /*
+ * Arm the OP-TEE asynchronous notification subsystem (OPTEE_ABI_ENABLE_ASYNC_NOTIF
+ * blocking call, the mirror of FF-A's OPTEE_FFA_ENABLE_ASYNC_NOTIF).  The reserved
+ * bottom-half signal value is handed to OP-TEE so that a raise of that value is
+ * understood as a request to run the driver bottom half rather than as a plain
+ * notification key.
+ */
+static int optee_riscv_enable_async_notif(struct optee *optee)
+{
+	u64 in[4] = { OPTEE_ABI_ENABLE_ASYNC_NOTIF,
+		      optee->riscv.bottom_half_value };
+	u64 out[4] = { };
+	int rc;
+
+	rc = optee_riscv_tee_call(optee, in, out);
+	if (rc)
+		return rc;
+	if (out[0])
+		return -EINVAL;
+
+	return 0;
+}
+
+/*
  * Set up the signal bus with OP-TEE (TEE_SIGNAL_BUS_SETUP, service 0x05) and
  * request the availability doorbell IRQ.  The bus must be set up by the REE
  * (RPMI spec section 4.16.7) and is sized so every OP-TEE async notification
@@ -957,7 +980,14 @@ static int optee_riscv_setup_signal_bus(struct optee *optee)
 	struct rpmi_tee_signal_bus_setup_req tx = {
 		.target_id = cpu_to_le32(RPMI_TEE_ENDPOINT_OPTEE),
 		.bus_width = cpu_to_le32(OPTEE_ABI_ASYNC_NOTIF_BUS_WIDTH),
-		.sender_signals = 0,
+		/*
+		 * SENDER_SIGNALS (RPMI spec Table 190) is the number of signals
+		 * reserved for us, the sender, to receive: signals 0 <= x < N
+		 * are raised by the target (OP-TEE) and read by us.  We only
+		 * ever receive notifications from OP-TEE and never raise any, so
+		 * reserve the whole bus for OP-TEE to raise.
+		 */
+		.sender_signals = cpu_to_le32(OPTEE_ABI_ASYNC_NOTIF_BUS_WIDTH),
 	};
 	struct rpmi_tee_signal_bus_setup_resp rx = { };
 	struct rpmi_mbox_message msg;
@@ -1034,8 +1064,15 @@ static int optee_riscv_async_notif_init(struct platform_device *pdev,
 	optee->riscv.signal_irq = irq;
 	optee->riscv.bottom_half_value = OPTEE_ABI_ASYNC_NOTIF_BOTTOM_HALF;
 
+	rc = optee_riscv_enable_async_notif(optee);
+	if (rc)
+		goto err_irq;
+
 	return 0;
 
+err_irq:
+	free_irq(irq, optee);
+	optee->riscv.signal_irq = 0;
 err_bus:
 	optee_riscv_teardown_signal_bus(optee);
 err_wq:
