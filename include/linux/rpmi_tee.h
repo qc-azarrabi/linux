@@ -138,11 +138,36 @@ struct rpmi_tee_mem_ops {
 	int (*memory_reclaim)(struct rpmi_tee_device *rdev, u32 parcel_id);
 };
 
+typedef void (*rpmi_tee_notifier_cb)(struct rpmi_tee_device *rdev,
+				     u32 signal, void *cb_data);
+
+/* RPMI TEE signal notification operations. */
+struct rpmi_tee_notifier_ops {
+	/**
+	 * @notify_request: Allocate a TEE-to-REE signal and associate it with
+	 *	@cb and @cb_data. Return the allocated ID through @signal.
+	 */
+	int (*notify_request)(struct rpmi_tee_device *rdev,
+			      rpmi_tee_notifier_cb cb, void *cb_data,
+			      u32 *signal);
+	/**
+	 * @notify_relinquish: Stop dispatching a TEE-to-REE @signal previously
+	 *	allocated for @rdev. Release is asynchronous; callbacks may
+	 *	relinquish their own signals.
+	 */
+	int (*notify_relinquish)(struct rpmi_tee_device *rdev, u32 signal);
+	/**
+	 * @signal_raise: Raise the TEE service's chosen REE-to-TEE @signal.
+	 */
+	int (*signal_raise)(struct rpmi_tee_device *rdev, u32 signal);
+};
+
 /* RPMI TEE transport operation groups. */
 struct rpmi_tee_ops {
 	const struct rpmi_tee_info_ops *info_ops;
 	const struct rpmi_tee_msg_ops *msg_ops;
 	const struct rpmi_tee_mem_ops *mem_ops;
+	const struct rpmi_tee_notifier_ops *notifier_ops;
 };
 
 extern const struct bus_type rpmi_tee_bus_type;
