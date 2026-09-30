@@ -604,6 +604,9 @@ static bool is_normal_memory(pgprot_t p)
 #elif defined(CONFIG_ARM64)
 	return ((pgprot_val(p) & PTE_ATTRINDX_MASK) == PTE_ATTRINDX(MT_NORMAL)) ||
 	       ((pgprot_val(p) & PTE_ATTRINDX_MASK) == PTE_ATTRINDX(MT_NORMAL_TAGGED));
+#elif defined(CONFIG_RISCV)
+	return (pgprot_val(p) & _PAGE_MTMASK) ==
+	       (pgprot_val(PAGE_KERNEL) & _PAGE_MTMASK);
 #else
 #error "Unsupported architecture"
 #endif
